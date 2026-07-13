@@ -6,6 +6,49 @@
     "ReplicatedStorage": {
       "Shared": {
         "$path": "src/shared"
+      },
+
+      "Remotes": {
+        "$className": "Folder",
+        "CleanSegmentRequest": {
+          "$className": "RemoteEvent"
+        },
+        "AcceptJobRequest": {
+          "$className": "RemoteEvent"
+        },
+        "QuitJobRequest": {
+          "$className": "RemoteEvent"
+        },
+        "JobStateChanged": {
+          "$className": "RemoteEvent"
+        },
+        "RespawnVehicleRequest": {
+          "$className": "RemoteEvent"
+        },
+        "PurchaseItemRequest": {
+          "$className": "RemoteEvent"
+        },
+        "EquipItemRequest": {
+          "$className": "RemoteEvent"
+        },
+        "PurchaseTankRequest": {
+          "$className": "RemoteEvent"
+        },
+        "HatchEggRequest": {
+          "$className": "RemoteEvent"
+        },
+        "PetHatched": {
+          "$className": "RemoteEvent"
+        },
+        "EquipPetRequest": {
+          "$className": "RemoteEvent"
+        },
+        "PetInventoryChanged": {
+          "$className": "RemoteEvent"
+        },
+        "PetInventoryRequest": {
+          "$className": "RemoteEvent"
+        }
       }
     },
 
