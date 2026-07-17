@@ -1,15 +1,137 @@
 --!strict
 
--- Client-only hatching feedback and inventory display. Cash, RNG, ownership,
--- equipped state, and multipliers are all validated by PetServer.
+-- Controls the hand-authored StarterGui.PetUI. Each manual pet button should
+-- either be named with its pet ID or have a string PetID attribute.
 
 local Players = game:GetService("Players")
 local ProximityPromptService = game:GetService("ProximityPromptService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
+local function waitForDescendant(root: Instance, name: string, timeout: number): Instance?
+	local deadline = os.clock() + timeout
+	repeat
+		local candidate = root:FindFirstChild(name, true)
+		if candidate then
+			return candidate
+		end
+		task.wait(0.1)
+	until os.clock() >= deadline
+	return nil
+end
+
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
-local SharedPetData = require(ReplicatedStorage.Shared.SharedPetData)
+local petGuiInstance = playerGui:WaitForChild("PetUI", 10)
+if petGuiInstance == nil or not petGuiInstance:IsA("ScreenGui") then
+	warn(string.format(
+		"Type mismatch: PlayerGui.PetUI found %s; expected ScreenGui.",
+		petGuiInstance and petGuiInstance.ClassName or "nil (not found)"
+	))
+	return
+end
+local petGui = petGuiInstance
+local inventoryFrameInstance = waitForDescendant(petGui, "Frame", 10)
+if inventoryFrameInstance == nil
+	or (not inventoryFrameInstance:IsA("Frame") and not inventoryFrameInstance:IsA("ScrollingFrame"))
+then
+	warn(string.format(
+		"Type mismatch: PlayerGui.PetUI.Frame found %s; expected Frame or ScrollingFrame.",
+		inventoryFrameInstance and inventoryFrameInstance.ClassName or "nil (not found)"
+	))
+	return
+end
+local inventoryFrame = inventoryFrameInstance :: GuiObject
+
+-- Prefer the final authored name. During this transition, migrate the current
+-- TextButton automatically so Studio and the controller agree on OpenPets.
+local openPetsInstance = waitForDescendant(inventoryFrame, "OpenPets", 1)
+if openPetsInstance == nil then
+	openPetsInstance = waitForDescendant(inventoryFrame, "TextButton", 2)
+		or waitForDescendant(petGui, "OpenPets", 1)
+		or waitForDescendant(petGui, "TextButton", 2)
+
+	-- Last-resort compatibility for manually renamed/nested buttons.
+	if openPetsInstance == nil then
+		for _, descendant in petGui:GetDescendants() do
+			if descendant:IsA("GuiButton") then
+				local lowerName = string.lower(descendant.Name)
+				local lowerText = if descendant:IsA("TextButton") then string.lower(descendant.Text) else ""
+				if string.find(lowerName, "pet", 1, true)
+					or string.find(lowerName, "open", 1, true)
+					or string.find(lowerText, "pet", 1, true)
+				then
+					openPetsInstance = descendant
+					break
+				end
+			end
+		end
+	end
+	if openPetsInstance then
+		openPetsInstance.Name = "OpenPets"
+	end
+end
+if openPetsInstance == nil or (not openPetsInstance:IsA("TextButton") and not openPetsInstance:IsA("ImageButton")) then
+	warn(string.format(
+		"Type mismatch: PlayerGui.PetUI.Frame.OpenPets found %s; expected TextButton or ImageButton.",
+		openPetsInstance and openPetsInstance.ClassName or "nil (not found)"
+	))
+	return
+end
+local openPetsButton = openPetsInstance :: GuiButton
+
+local closePetsButton: GuiButton? = nil
+for _, descendant in inventoryFrame:GetDescendants() do
+	if descendant:IsA("GuiButton") and descendant ~= openPetsButton then
+		local action = descendant:GetAttribute("Action")
+		local lowerName = string.lower(descendant.Name)
+		local lowerText = if descendant:IsA("TextButton") then string.lower(descendant.Text) else ""
+		if action == "ClosePets"
+			or action == "Close"
+			or string.find(lowerName, "close", 1, true)
+			or lowerName == "x"
+			or lowerText == "close"
+			or lowerText == "x"
+		then
+			closePetsButton = descendant
+			break
+		end
+	end
+end
+
+local originalVisibility: {[GuiObject]: boolean} = {}
+for _, descendant in inventoryFrame:GetDescendants() do
+	if descendant:IsA("GuiObject") then
+		originalVisibility[descendant] = descendant.Visible
+	end
+end
+local originalBackgroundTransparency = inventoryFrame.BackgroundTransparency
+local popupOpen = false
+
+local function setPopupVisible(visible: boolean)
+	popupOpen = visible
+	-- Keep the root visible because OpenPets is nested inside it. Collapse its
+	-- other descendants and background instead of hiding the ancestor itself.
+	inventoryFrame.Visible = true
+	inventoryFrame.BackgroundTransparency = if visible then originalBackgroundTransparency else 1
+
+	for guiObject, wasVisible in originalVisibility do
+		if guiObject == openPetsButton or openPetsButton:IsDescendantOf(guiObject) then
+			guiObject.Visible = true
+		else
+			guiObject.Visible = if visible then wasVisible else false
+		end
+	end
+
+	if closePetsButton then
+		closePetsButton.Visible = visible
+		openPetsButton.Visible = not visible
+	else
+		-- Without a separate close button, OpenPets doubles as a toggle.
+		openPetsButton.Visible = true
+	end
+end
+
+local SharedPetData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SharedPetData"))
 local remotes = ReplicatedStorage:WaitForChild("Remotes")
 local HatchEggRequest = remotes:WaitForChild("HatchEggRequest") :: RemoteEvent
 local PetHatched = remotes:WaitForChild("PetHatched") :: RemoteEvent
@@ -19,133 +141,88 @@ local PetInventoryRequest = remotes:WaitForChild("PetInventoryRequest") :: Remot
 
 local ownedPets: {string} = {}
 local equippedPet: string? = nil
+local petButtons: {[string]: GuiButton} = {}
+local baseButtonText: {[GuiButton]: string} = {}
 
-local gui = Instance.new("ScreenGui")
-gui.Name = "PetUI"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = true
-gui.Parent = playerGui
+local statusLabel: TextLabel? = nil
+local namedStatus = inventoryFrame:FindFirstChild("HatchResult", true)
+if namedStatus and namedStatus:IsA("TextLabel") then
+	statusLabel = namedStatus
+else
+	statusLabel = inventoryFrame:FindFirstChildWhichIsA("TextLabel", true)
+end
 
-local openButton = Instance.new("TextButton")
-openButton.AnchorPoint = Vector2.new(1, 1)
-openButton.Position = UDim2.fromScale(0.97, 0.84)
-openButton.Size = UDim2.fromOffset(128, 44)
-openButton.BackgroundColor3 = Color3.fromRGB(137, 82, 173)
-openButton.Text = "PETS"
-openButton.TextColor3 = Color3.new(1, 1, 1)
-openButton.TextSize = 16
-openButton.Font = Enum.Font.GothamBold
-openButton.Parent = gui
-Instance.new("UICorner", openButton).CornerRadius = UDim.new(0, 10)
-
-local panel = Instance.new("Frame")
-panel.AnchorPoint = Vector2.new(0.5, 0.5)
-panel.Position = UDim2.fromScale(0.5, 0.5)
-panel.Size = UDim2.fromOffset(390, 380)
-panel.BackgroundColor3 = Color3.fromRGB(35, 26, 48)
-panel.Visible = false
-panel.Parent = gui
-Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 16)
-
-local title = Instance.new("TextLabel")
-title.Position = UDim2.fromOffset(18, 12)
-title.Size = UDim2.new(1, -36, 0, 42)
-title.BackgroundTransparency = 1
-title.Text = string.format("PET INVENTORY  •  EGG $%d", SharedPetData.EggCost)
-title.TextColor3 = Color3.fromRGB(255, 233, 255)
-title.TextSize = 18
-title.Font = Enum.Font.GothamBold
-title.Parent = panel
-
-local list = Instance.new("ScrollingFrame")
-list.Position = UDim2.fromOffset(16, 62)
-list.Size = UDim2.new(1, -32, 1, -78)
-list.BackgroundTransparency = 1
-list.BorderSizePixel = 0
-list.ScrollBarThickness = 5
-list.Parent = panel
-local layout = Instance.new("UIListLayout")
-layout.Padding = UDim.new(0, 8)
-layout.Parent = list
-layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-	list.CanvasSize = UDim2.fromOffset(0, layout.AbsoluteContentSize.Y + 8)
-end)
-
-local function renderInventory()
-	for _, child in list:GetChildren() do
-		if child:IsA("GuiObject") then
-			child:Destroy()
+local function petIDForButton(button: GuiButton): string?
+	local attribute = button:GetAttribute("PetID")
+	if typeof(attribute) == "string" and SharedPetData.Pets[attribute] ~= nil then
+		return attribute
+	end
+	if SharedPetData.Pets[button.Name] ~= nil then
+		return button.Name
+	end
+	local text = if button:IsA("TextButton") then button.Text else ""
+	for petID in SharedPetData.Pets do
+		if string.find(button.Name, petID, 1, true) or string.find(text, petID, 1, true) then
+			return petID
 		end
 	end
+	return nil
+end
 
-	if #ownedPets == 0 then
-		local empty = Instance.new("TextLabel")
-		empty.Size = UDim2.new(1, 0, 0, 50)
-		empty.BackgroundTransparency = 1
-		empty.Text = "No pets yet — buy an egg at the incubator!"
-		empty.TextColor3 = Color3.fromRGB(220, 205, 230)
-		empty.TextSize = 15
-		empty.Font = Enum.Font.GothamMedium
-		empty.Parent = list
-		return
-	end
-
-	for _, petID in ownedPets do
-		local pet = SharedPetData.Pets[petID]
-		if pet ~= nil then
-			local row = Instance.new("Frame")
-			row.Size = UDim2.new(1, -4, 0, 58)
-			row.BackgroundColor3 = Color3.fromRGB(67, 51, 86)
-			row.Parent = list
-			Instance.new("UICorner", row).CornerRadius = UDim.new(0, 9)
-
-			local text = Instance.new("TextLabel")
-			text.Position = UDim2.fromOffset(12, 5)
-			text.Size = UDim2.new(1, -118, 1, -10)
-			text.BackgroundTransparency = 1
-			text.Text = string.format("%s (%s)\n%.1fx Cash  •  %.1fx Speed", pet.Name, pet.Rarity, pet.CashMult, pet.SpeedMult)
-			text.TextColor3 = Color3.fromRGB(250, 244, 255)
-			text.TextSize = 13
-			text.Font = Enum.Font.GothamMedium
-			text.TextXAlignment = Enum.TextXAlignment.Left
-			text.Parent = row
-
-			local equip = Instance.new("TextButton")
-			equip.AnchorPoint = Vector2.new(1, 0.5)
-			equip.Position = UDim2.new(1, -10, 0.5, 0)
-			equip.Size = UDim2.fromOffset(94, 36)
-			equip.BackgroundColor3 = equippedPet == petID and Color3.fromRGB(77, 159, 105) or Color3.fromRGB(108, 76, 146)
-			equip.Text = equippedPet == petID and "EQUIPPED" or "EQUIP"
-			equip.TextColor3 = Color3.new(1, 1, 1)
-			equip.TextSize = 12
-			equip.Font = Enum.Font.GothamBold
-			equip.Parent = row
-			Instance.new("UICorner", equip).CornerRadius = UDim.new(0, 8)
-			equip.Activated:Connect(function()
+for _, descendant in inventoryFrame:GetDescendants() do
+	if descendant:IsA("GuiButton") then
+		local petID = petIDForButton(descendant)
+		if petID then
+			petButtons[petID] = descendant
+			if descendant:IsA("TextButton") then
+				baseButtonText[descendant] = descendant.Text
+			end
+			descendant.Activated:Connect(function()
 				EquipPetRequest:FireServer(petID)
 			end)
 		end
 	end
 end
 
-local hatchPopup = Instance.new("TextLabel")
-hatchPopup.AnchorPoint = Vector2.new(0.5, 0.5)
-hatchPopup.Position = UDim2.fromScale(0.5, 0.3)
-hatchPopup.Size = UDim2.fromOffset(330, 90)
-hatchPopup.BackgroundColor3 = Color3.fromRGB(63, 42, 84)
-hatchPopup.TextColor3 = Color3.new(1, 1, 1)
-hatchPopup.TextSize = 22
-hatchPopup.Font = Enum.Font.GothamBold
-hatchPopup.Visible = false
-hatchPopup.Parent = gui
-Instance.new("UICorner", hatchPopup).CornerRadius = UDim.new(0, 14)
+local function renderInventory()
+	local ownedSet: {[string]: boolean} = {}
+	for _, petID in ownedPets do
+		ownedSet[petID] = true
+	end
 
-openButton.Activated:Connect(function()
-	panel.Visible = not panel.Visible
-	if panel.Visible then
+	for petID, button in petButtons do
+		button.Visible = ownedSet[petID] == true
+		button:SetAttribute("Equipped", equippedPet == petID)
+		if button:IsA("TextButton") then
+			local original = baseButtonText[button] or petID
+			button.Text = if equippedPet == petID then original .. "  •  EQUIPPED" else original
+		end
+	end
+
+	if not popupOpen then
+		setPopupVisible(false)
+	end
+end
+
+openPetsButton.Activated:Connect(function()
+	if popupOpen and closePetsButton == nil then
+		setPopupVisible(false)
+	else
+		setPopupVisible(true)
 		PetInventoryRequest:FireServer()
 	end
 end)
+
+if closePetsButton then
+	closePetsButton.Activated:Connect(function()
+		setPopupVisible(false)
+	end)
+else
+	warn("PetUI has no Close/ClosePets/X button; OpenPets will toggle the popup instead.")
+end
+
+-- Start collapsed; inventory synchronization must not open the popup.
+setPopupVisible(false)
 
 ProximityPromptService.PromptTriggered:Connect(function(prompt)
 	if prompt.Name == "EggPrompt" then
@@ -155,14 +232,17 @@ end)
 
 PetHatched.OnClientEvent:Connect(function(petID)
 	local pet = SharedPetData.Pets[petID]
-	if pet == nil then
+	if pet == nil or statusLabel == nil then
 		return
 	end
 
-	hatchPopup.Text = string.format("YOU HATCHED A %s!\n%s", pet.Name:upper(), pet.Rarity)
-	hatchPopup.Visible = true
+	local label = statusLabel :: TextLabel
+	local previousText = label.Text
+	label.Text = string.format("YOU HATCHED A %s!  •  %s", pet.Name:upper(), pet.Rarity)
 	task.delay(3, function()
-		hatchPopup.Visible = false
+		if label.Parent ~= nil then
+			label.Text = previousText
+		end
 	end)
 end)
 

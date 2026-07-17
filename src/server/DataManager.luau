@@ -5,7 +5,9 @@
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local ProfileService = require(ReplicatedStorage.Shared.Packages.ProfileService)
+local shared = ReplicatedStorage:WaitForChild("Shared")
+local packages = shared:WaitForChild("Packages")
+local ProfileService = require(packages:WaitForChild("ProfileService"))
 
 export type PlayerData = {
 	Cash: number,
@@ -73,6 +75,15 @@ local function syncCashLeaderstat(player: Player, cash: number)
 	end
 end
 
+local function syncWaterAttributes(player: Player, data: PlayerData)
+	if player.Parent == nil then
+		return
+	end
+
+	player:SetAttribute("Water", data.Water)
+	player:SetAttribute("MaxWater", data.MaxWater)
+end
+
 function DataManager:GetProfile(player: Player)
 	return profiles[player]
 end
@@ -119,6 +130,7 @@ function DataManager:LoadProfile(player: Player)
 	end
 
 	profiles[player] = profile
+	syncWaterAttributes(player, profile.Data)
 	return profile
 end
 
@@ -168,21 +180,40 @@ function DataManager:DeductWater(player: Player, amount: number): boolean
 	end
 
 	local data = self:GetData(player)
-	if data == nil or data.Water < amount then
+	if data == nil or data.Water <= 0 then
 		return false
 	end
 
-	data.Water -= amount
+	data.Water = math.max(0, data.Water - amount)
+	syncWaterAttributes(player, data)
 	return true
 end
 
-function DataManager:RefillWater(player: Player): boolean
+function DataManager:RefillWater(player: Player, targetAmount: number?): boolean
 	local data = self:GetData(player)
 	if data == nil then
 		return false
 	end
 
-	data.Water = data.MaxWater
+	if targetAmount ~= nil then
+		if not isValidAmount(targetAmount) or targetAmount < 0 then
+			return false
+		end
+		data.Water = math.min(targetAmount, data.MaxWater)
+	else
+		data.Water = data.MaxWater
+	end
+	syncWaterAttributes(player, data)
+	return true
+end
+
+function DataManager:SyncWater(player: Player): boolean
+	local data = self:GetData(player)
+	if data == nil then
+		return false
+	end
+
+	syncWaterAttributes(player, data)
 	return true
 end
 

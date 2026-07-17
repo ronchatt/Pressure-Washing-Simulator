@@ -20,7 +20,9 @@ local SharedJobData = {
 		"Mansion_1",
 	},
 	Jobs = {
-		Bench_1 = { JobID = "Bench_1", RequiredTier = "Benches", TotalSegments = 25, Reward = 75 },
+		-- Development driveway prototype reuses Bench_1 so the starter tier and
+		-- existing phone button can launch the pixel-cleaning test immediately.
+		Bench_1 = { JobID = "Bench_1", RequiredTier = "Benches", TotalSegments = 3456, Reward = 50 },
 		Fence_1 = { JobID = "Fence_1", RequiredTier = "Fences", TotalSegments = 50, Reward = 225 },
 		Car_1 = { JobID = "Car_1", RequiredTier = "Cars", TotalSegments = 75, Reward = 500 },
 		Driveway_1 = { JobID = "Driveway_1", RequiredTier = "Driveways", TotalSegments = 125, Reward = 1_000 },

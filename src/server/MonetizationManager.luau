@@ -14,6 +14,12 @@ local initialized = false
 local ownership: {[Player]: {InfiniteWater: boolean, DoubleSpeed: boolean}} = {}
 
 local function ownsPass(userId: number, gamepassId: number): boolean
+	-- Placeholder IDs are never treated as owned during development. Replace
+	-- them with this experience's real pass IDs to enable Marketplace checks.
+	if gamepassId == 1111111 or gamepassId == 2222222 then
+		return false
+	end
+
 	local success, result = pcall(function()
 		return MarketplaceService:UserOwnsGamePassAsync(userId, gamepassId)
 	end)

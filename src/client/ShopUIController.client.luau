@@ -10,7 +10,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
-local SharedShopData = require(ReplicatedStorage.Shared.SharedShopData)
+local SharedShopData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SharedShopData"))
 local remotes = ReplicatedStorage:WaitForChild("Remotes")
 local PurchaseItemRequest = remotes:WaitForChild("PurchaseItemRequest") :: RemoteEvent
 local EquipItemRequest = remotes:WaitForChild("EquipItemRequest") :: RemoteEvent

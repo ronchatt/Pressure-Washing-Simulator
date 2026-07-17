@@ -4,10 +4,11 @@
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
 
 local DataManager = require(script.Parent:WaitForChild("DataManager"))
 local MonetizationManager = require(script.Parent:WaitForChild("MonetizationManager"))
-local SharedPetData = require(ReplicatedStorage.Shared.SharedPetData)
+local SharedPetData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SharedPetData"))
 
 local remotes = ReplicatedStorage:WaitForChild("Remotes")
 local HatchEggRequest = remotes:WaitForChild("HatchEggRequest") :: RemoteEvent
@@ -74,7 +75,8 @@ local function syncInventory(player: Player)
 end
 
 local function ensureEggPrompt()
-	local base = workspace:FindFirstChild("Base")
+	local environment = Workspace:FindFirstChild("EnvironmentFixtures")
+	local base = environment and environment:FindFirstChild("Base")
 	local incubator = base and base:FindFirstChild("EggIncubator")
 	if incubator == nil then
 		return
@@ -132,7 +134,10 @@ function PetServer:Init()
 
 	HatchEggRequest.OnServerEvent:Connect(function(player)
 		local data = DataManager:GetData(player)
-		if data == nil or not DataManager:DeductCash(player, SharedPetData.EggCost) then
+		if data == nil then
+			return
+		end
+		if SharedPetData.EggCost > 0 and not DataManager:DeductCash(player, SharedPetData.EggCost) then
 			return
 		end
 

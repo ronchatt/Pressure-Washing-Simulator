@@ -9,7 +9,8 @@ export type PetDefinition = {
 }
 
 local SharedPetData = {
-	EggCost = 500,
+	-- Development override. Restore a production price before release.
+	EggCost = 0,
 	Pets = {
 		Dog = { Name = "Dog", Rarity = "Common", Weight = 70, CashMult = 1.1, SpeedMult = 1.1 },
 		Cat = { Name = "Cat", Rarity = "Rare", Weight = 25, CashMult = 1.5, SpeedMult = 1.2 },

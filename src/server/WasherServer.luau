@@ -7,24 +7,27 @@
 local CollectionService = game:GetService("CollectionService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
 
 local DataManager = require(script.Parent:WaitForChild("DataManager"))
 local JobManager = require(script.Parent:WaitForChild("JobManager"))
 local MonetizationManager = require(script.Parent:WaitForChild("MonetizationManager"))
 
 local DIRT_TAG = "DirtSegment"
-local MAX_CLEAN_DISTANCE = 20
-local BASE_MAX_WATER = 100
-local DEFAULT_CLEAN_SPEED = 0.5
+-- Matches the client's 90-stud falloff range with a small allowance for the
+-- distance between HumanoidRootPart and the equipped nozzle.
+local MAX_CLEAN_DISTANCE = 95
 local TARGET_EMPTY_DURATION = 30
--- A full segment takes 1 / CleanSpeed seconds. At 0.5, that is two seconds;
--- 100 / 30 * 2 = 6.666... water per completed segment.
-local WATER_PER_SEGMENT = BASE_MAX_WATER / (TARGET_EMPTY_DURATION * DEFAULT_CLEAN_SPEED)
+local WATER_REPORT_INTERVAL = 0.25
+local HYDRANT_REFILL_AMOUNT = 100
 
 local CleanSegmentRequest = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CleanSegmentRequest") :: RemoteEvent
+local SprayWaterRequest = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SprayWaterRequest") :: RemoteEvent
 
 local WasherServer = {}
 local initialized = false
+local lastWaterReport: {[Player]: number} = {}
+local recentValidSpray: {[Player]: {JobID: string, Timestamp: number}} = {}
 
 local function getWorldPosition(segment: Instance): Vector3?
 	if segment:IsA("BasePart") then
@@ -35,11 +38,21 @@ local function getWorldPosition(segment: Instance): Vector3?
 		return segment.Parent.Position
 	end
 
+	-- Pixel dirt is represented by GuiObjects under a SurfaceGui. Walk up to
+	-- the replicated driveway part for distance validation.
+	local ancestor = segment.Parent
+	while ancestor do
+		if ancestor:IsA("BasePart") then
+			return ancestor.Position
+		end
+		ancestor = ancestor.Parent
+	end
+
 	return nil
 end
 
 local function isValidCleaningRequest(player: Player, segment: Instance): boolean
-	if not segment:IsDescendantOf(workspace) or not CollectionService:HasTag(segment, DIRT_TAG) then
+	if not segment:IsDescendantOf(Workspace) or not CollectionService:HasTag(segment, DIRT_TAG) then
 		return false
 	end
 
@@ -74,7 +87,7 @@ local function isValidCleaningRequest(player: Player, segment: Instance): boolea
 		return false
 	end
 
-	if not MonetizationManager:OwnsInfiniteWater(player) and data.Water < WATER_PER_SEGMENT then
+	if not MonetizationManager:OwnsInfiniteWater(player) and data.Water <= 0 then
 		return false
 	end
 
@@ -86,7 +99,11 @@ local function cleanSegment(player: Player, segment: Instance)
 		return
 	end
 
-	if not MonetizationManager:OwnsInfiniteWater(player) and not DataManager:DeductWater(player, WATER_PER_SEGMENT) then
+	local recentSpray = recentValidSpray[player]
+	if recentSpray == nil
+		or recentSpray.JobID ~= segment:GetAttribute("JobID")
+		or os.clock() - recentSpray.Timestamp > 0.75
+	then
 		return
 	end
 
@@ -96,18 +113,93 @@ local function cleanSegment(player: Player, segment: Instance)
 	end
 end
 
+local function consumeSprayWater(player: Player, segment: Instance?)
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if root == nil or not root:IsA("BasePart") or character:FindFirstChildOfClass("Tool") == nil then
+		return
+	end
+
+	local data = DataManager:GetData(player)
+	if data == nil or data.Water <= 0 then
+		return
+	end
+
+	local now = os.clock()
+	local previousReport = lastWaterReport[player]
+	local elapsed = previousReport and now - previousReport or WATER_REPORT_INTERVAL
+	if previousReport ~= nil and elapsed < WATER_REPORT_INTERVAL * 0.6 then
+		return
+	end
+
+	lastWaterReport[player] = now
+	-- A valid dirt target authorizes the later completion report. Water itself
+	-- is consumed whenever the equipped washer is spraying, including into air.
+	if segment ~= nil and isValidCleaningRequest(player, segment) then
+		local jobID = segment:GetAttribute("JobID")
+		if typeof(jobID) == "string" then
+			recentValidSpray[player] = { JobID = jobID, Timestamp = now }
+		end
+	end
+
+	if MonetizationManager:OwnsInfiniteWater(player) then
+		return
+	end
+
+	local waterPerSecond = data.MaxWater / TARGET_EMPTY_DURATION
+	DataManager:DeductWater(player, waterPerSecond * WATER_REPORT_INTERVAL)
+end
+
+local function connectHydrantRefill()
+	local environment = Workspace:FindFirstChild("EnvironmentFixtures")
+	local base = environment and environment:FindFirstChild("Base")
+	local hydrant = base and base:FindFirstChild("FireHydrant")
+	local prompt = hydrant and hydrant:FindFirstChild("HydrantRefillPrompt", true)
+	if prompt == nil or not prompt:IsA("ProximityPrompt") then
+		warn("WasherServer could not find EnvironmentFixtures.Base.FireHydrant.HydrantRefillPrompt")
+		return
+	end
+
+	prompt.Triggered:Connect(function(player)
+		if DataManager:RefillWater(player, HYDRANT_REFILL_AMOUNT) then
+			print(string.format("DIAGNOSTIC: Refilled %s's water to %d at the fire hydrant.", player.Name, HYDRANT_REFILL_AMOUNT))
+		end
+	end)
+end
+
 function WasherServer:Init()
 	if initialized then
 		return
 	end
 	initialized = true
+	connectHydrantRefill()
 
 	CleanSegmentRequest.OnServerEvent:Connect(function(player, segment)
-		if typeof(segment) ~= "Instance" then
+		if typeof(segment) == "Instance" then
+			cleanSegment(player, segment)
+		elseif typeof(segment) == "table" then
+			-- Clients batch nearby coverage cells to avoid losing progress to a
+			-- burst of individual RemoteEvents. Every cell is still validated.
+			for index = 1, math.min(#segment, 1024) do
+				local claimedSegment = segment[index]
+				if typeof(claimedSegment) == "Instance" then
+					cleanSegment(player, claimedSegment)
+				end
+			end
+		end
+	end)
+
+	SprayWaterRequest.OnServerEvent:Connect(function(player, segment)
+		if segment ~= nil and typeof(segment) ~= "Instance" then
 			return
 		end
 
-		cleanSegment(player, segment)
+		consumeSprayWater(player, segment)
+	end)
+
+	Players.PlayerRemoving:Connect(function(player)
+		lastWaterReport[player] = nil
+		recentValidSpray[player] = nil
 	end)
 end
 

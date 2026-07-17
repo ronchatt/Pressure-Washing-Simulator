@@ -6,17 +6,22 @@
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local Workspace = game:GetService("Workspace")
 
 local DataManager = require(script.Parent:WaitForChild("DataManager"))
-local SharedJobData = require(ReplicatedStorage.Shared.SharedJobData)
-local SharedPetData = require(ReplicatedStorage.Shared.SharedPetData)
+local shared = ReplicatedStorage:WaitForChild("Shared")
+local SharedJobData = require(shared:WaitForChild("SharedJobData"))
+local SharedPetData = require(shared:WaitForChild("SharedPetData"))
 
 export type JobTemplate = SharedJobData.JobTemplate
 
 export type ActiveJobData = {
 	JobID: string,
 	SegmentsCleaned: number,
+	TotalSegments: number,
 	CleanedInstances: {Instance},
+	CleanedLookup: {[Instance]: boolean},
 }
 
 local JOBS: {[string]: JobTemplate} = SharedJobData.Jobs
@@ -28,6 +33,17 @@ local JobStateChanged = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("
 local JobManager = {}
 local activeJobs: {[number]: ActiveJobData} = {}
 local initialized = false
+local JOB_COMPLETION_RATIO = 0.9
+
+local function getRuntimeSegmentCount(jobID: string, fallback: number): number
+	local count = 0
+	for _, segment in CollectionService:GetTagged("DirtSegment") do
+		if segment:IsDescendantOf(Workspace) and segment:GetAttribute("JobID") == jobID then
+			count += 1
+		end
+	end
+	return if count > 0 then count else fallback
+end
 
 local function hasUnlockedTier(player: Player, requiredTier: string): boolean
 	local data = DataManager:GetData(player)
@@ -62,16 +78,20 @@ function JobManager:AcceptJob(player: Player, jobID: string): boolean
 		return false
 	end
 
+	local totalSegments = getRuntimeSegmentCount(job.JobID, job.TotalSegments)
 	activeJobs[player.UserId] = {
 		JobID = job.JobID,
 		SegmentsCleaned = 0,
+		TotalSegments = totalSegments,
 		CleanedInstances = {},
+		CleanedLookup = {},
 	}
 	JobStateChanged:FireClient(player, {
 		State = "Active",
 		JobID = job.JobID,
 		SegmentsCleaned = 0,
-		TotalSegments = job.TotalSegments,
+		TotalSegments = totalSegments,
+		CompletionPercent = 0,
 	})
 	return true
 end
@@ -82,13 +102,7 @@ function JobManager:HasCleanedSegment(player: Player, segment: Instance): boolea
 		return false
 	end
 
-	for _, cleanedSegment in activeJob.CleanedInstances do
-		if cleanedSegment == segment then
-			return true
-		end
-	end
-
-	return false
+	return activeJob.CleanedLookup[segment] == true
 end
 
 function JobManager:RecordCleanedSegment(player: Player, segment: Instance): JobTemplate?
@@ -104,15 +118,20 @@ function JobManager:RecordCleanedSegment(player: Player, segment: Instance): Job
 	end
 
 	table.insert(activeJob.CleanedInstances, segment)
+	activeJob.CleanedLookup[segment] = true
 	activeJob.SegmentsCleaned += 1
+	local completionPercent = math.clamp(activeJob.SegmentsCleaned / activeJob.TotalSegments * 100, 0, 100)
+	local requiredSegments = math.ceil(activeJob.TotalSegments * JOB_COMPLETION_RATIO)
 
-	if activeJob.SegmentsCleaned >= job.TotalSegments then
+	if activeJob.SegmentsCleaned >= requiredSegments then
 		activeJobs[player.UserId] = nil
 		JobStateChanged:FireClient(player, {
 			State = "Completed",
 			JobID = job.JobID,
-			SegmentsCleaned = job.TotalSegments,
-			TotalSegments = job.TotalSegments,
+			SegmentsCleaned = activeJob.SegmentsCleaned,
+			TotalSegments = activeJob.TotalSegments,
+			CompletionPercent = completionPercent,
+			CompletionThreshold = JOB_COMPLETION_RATIO * 100,
 			Reward = job.Reward,
 		})
 		return job
@@ -122,7 +141,8 @@ function JobManager:RecordCleanedSegment(player: Player, segment: Instance): Job
 		State = "Progress",
 		JobID = job.JobID,
 		SegmentsCleaned = activeJob.SegmentsCleaned,
-		TotalSegments = job.TotalSegments,
+		TotalSegments = activeJob.TotalSegments,
+		CompletionPercent = completionPercent,
 	})
 
 	return nil

@@ -5,10 +5,11 @@
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
 
 local DataManager = require(script.Parent:WaitForChild("DataManager"))
-local SharedShopData = require(ReplicatedStorage.Shared.SharedShopData)
-local VehicleManager = require(script.Parent:WaitForChild("VehicleManager"))
+local SharedShopData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SharedShopData"))
+local EquipmentManager = require(script.Parent:WaitForChild("EquipmentManager"))
 
 local remotes = ReplicatedStorage:WaitForChild("Remotes")
 local PurchaseItemRequest = remotes:WaitForChild("PurchaseItemRequest") :: RemoteEvent
@@ -52,7 +53,8 @@ local function syncWasherSpeed(player: Player)
 end
 
 local function ensureComputerPrompt()
-	local base = workspace:FindFirstChild("Base")
+	local environment = Workspace:FindFirstChild("EnvironmentFixtures")
+	local base = environment and environment:FindFirstChild("Base")
 	local computer = base and base:FindFirstChild("Computer")
 	if computer == nil then
 		return
@@ -108,9 +110,9 @@ local function equipItem(player: Player, category: string, itemName: string)
 	if category == "Washers" and SharedShopData.Washers[itemName] ~= nil and contains(data.OwnedWashers, itemName) then
 		data.EquippedWasher = itemName
 		syncWasherSpeed(player)
+		EquipmentManager:EquipPlayer(player)
 	elseif category == "Trucks" and SharedShopData.Trucks[itemName] ~= nil and contains(data.OwnedTrucks, itemName) then
 		data.EquippedTruck = itemName
-		VehicleManager:SpawnVehicle(player)
 	end
 end
 
@@ -127,6 +129,7 @@ local function purchaseTank(player: Player, tankID: string)
 
 	data.MaxWater = tier.NewMaxWater
 	data.Water = math.min(data.Water, data.MaxWater)
+	DataManager:SyncWater(player)
 end
 
 function ShopServer:Init()

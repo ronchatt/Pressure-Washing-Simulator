@@ -1,15 +1,91 @@
 --!strict
 
--- Local job-selection and navigation presentation. The server remains the
--- only authority for accepting jobs, cleaning progress, cash, and water.
+task.wait(1)
+print("DIAGNOSTIC: JobUIController is RUNNING.")
+
+-- Controls the hand-authored StarterGui.JobUI. This script never creates UI;
+-- cash, job acceptance, progress, and completion remain server-authoritative.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local function waitForDescendant(root: Instance, name: string, timeout: number): Instance?
+	local deadline = os.clock() + timeout
+	repeat
+		local candidate = root:FindFirstChild(name, true)
+		if candidate then
+			return candidate
+		end
+		task.wait(0.1)
+	until os.clock() >= deadline
+	return nil
+end
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
-local SharedJobData = require(ReplicatedStorage.Shared.SharedJobData)
+local phone = playerGui:FindFirstChild("JobUI")
+if phone == nil then
+	phone = playerGui:WaitForChild("JobUI", 10)
+end
+if phone then
+	print("DIAGNOSTIC: JobUI found in PlayerGui.")
+else
+	warn("DIAGNOSTIC: JobUI NOT FOUND in PlayerGui!")
+	return
+end
+local jobGuiInstance = phone
+if jobGuiInstance == nil or not jobGuiInstance:IsA("ScreenGui") then
+	warn(string.format(
+		"Type mismatch: PlayerGui.JobUI found %s; expected ScreenGui.",
+		jobGuiInstance and jobGuiInstance.ClassName or "nil (not found)"
+	))
+	return
+end
+local jobGui = jobGuiInstance
+local jobFrameInstance = waitForDescendant(jobGui, "Frame", 1)
+local jobFrame: Instance = jobGui
+if jobFrameInstance and (jobFrameInstance:IsA("Frame") or jobFrameInstance:IsA("ScrollingFrame")) then
+	jobFrame = jobFrameInstance
+elseif jobFrameInstance then
+	warn(string.format(
+		"Type mismatch: PlayerGui.JobUI.Frame found %s; expected Frame or ScrollingFrame. Searching all of JobUI instead.",
+		jobFrameInstance.ClassName
+	))
+end
+
+local phoneMenuInstance = waitForDescendant(jobGui, "PhoneMenu", 10)
+if phoneMenuInstance == nil or (not phoneMenuInstance:IsA("Frame") and not phoneMenuInstance:IsA("ScrollingFrame")) then
+	warn(string.format(
+		"Type mismatch: PlayerGui.JobUI.PhoneMenu found %s; expected Frame or ScrollingFrame.",
+		phoneMenuInstance and phoneMenuInstance.ClassName or "nil (not found)"
+	))
+	return
+end
+local phoneMenu = phoneMenuInstance :: GuiObject
+
+local progressPanelInstance = waitForDescendant(jobGui, "JobProgress", 10)
+if progressPanelInstance == nil or (not progressPanelInstance:IsA("Frame") and not progressPanelInstance:IsA("ScrollingFrame")) then
+	warn(string.format(
+		"Type mismatch: PlayerGui.JobUI.JobProgress found %s; expected Frame or ScrollingFrame.",
+		progressPanelInstance and progressPanelInstance.ClassName or "nil (not found)"
+	))
+	return
+end
+local progressPanel = progressPanelInstance :: GuiObject
+
+local openPhoneInstance = waitForDescendant(jobFrame, "OpenPhone", 3) or waitForDescendant(jobGui, "OpenPhone", 7)
+if openPhoneInstance == nil or (not openPhoneInstance:IsA("TextButton") and not openPhoneInstance:IsA("ImageButton")) then
+	warn(string.format(
+		"Type mismatch: PlayerGui.JobUI.Frame.OpenPhone found %s; expected TextButton or ImageButton.",
+		openPhoneInstance and openPhoneInstance.ClassName or "nil (not found)"
+	))
+	return
+end
+local openPhoneButton = openPhoneInstance :: GuiButton
+
+local SharedJobData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SharedJobData"))
 local remotes = ReplicatedStorage:WaitForChild("Remotes")
 local AcceptJobRequest = remotes:WaitForChild("AcceptJobRequest") :: RemoteEvent
 local QuitJobRequest = remotes:WaitForChild("QuitJobRequest") :: RemoteEvent
@@ -21,129 +97,150 @@ local totalSegments = 0
 local waypointFolder: Folder? = nil
 local waypointConnection: RBXScriptConnection? = nil
 
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "JobUI"
-screenGui.ResetOnSpawn = false
-screenGui.IgnoreGuiInset = true
-screenGui.Parent = playerGui
+-- WasherController uses this non-visual signal for immediate local prediction.
+local progressSignal = playerGui:FindFirstChild("JobProgressPredicted")
+if progressSignal == nil then
+	progressSignal = Instance.new("BindableEvent")
+	progressSignal.Name = "JobProgressPredicted"
+	progressSignal.Parent = playerGui
+end
+if not progressSignal:IsA("BindableEvent") then
+	warn(string.format(
+		"Type mismatch: PlayerGui.JobProgressPredicted found %s; expected BindableEvent.",
+		progressSignal.ClassName
+	))
+	return
+end
+local predictedProgressEvent = progressSignal :: BindableEvent
 
-local progressSignal = Instance.new("BindableEvent")
-progressSignal.Name = "JobProgressPredicted"
-progressSignal.Parent = playerGui
-
-local openPhoneButton = Instance.new("TextButton")
-openPhoneButton.Name = "OpenPhone"
-openPhoneButton.AnchorPoint = Vector2.new(1, 1)
-openPhoneButton.Position = UDim2.fromScale(0.97, 0.92)
-openPhoneButton.Size = UDim2.fromOffset(128, 46)
-openPhoneButton.BackgroundColor3 = Color3.fromRGB(38, 73, 112)
-openPhoneButton.Text = "PHONE"
-openPhoneButton.TextColor3 = Color3.new(1, 1, 1)
-openPhoneButton.TextSize = 18
-openPhoneButton.Font = Enum.Font.GothamBold
-openPhoneButton.Parent = screenGui
-Instance.new("UICorner", openPhoneButton).CornerRadius = UDim.new(0, 10)
-
-local phone = Instance.new("Frame")
-phone.Name = "PhoneMenu"
-phone.AnchorPoint = Vector2.new(0.5, 0.5)
-phone.Position = UDim2.fromScale(0.5, 0.5)
-phone.Size = UDim2.fromOffset(380, 460)
-phone.BackgroundColor3 = Color3.fromRGB(22, 28, 40)
-phone.Parent = screenGui
-Instance.new("UICorner", phone).CornerRadius = UDim.new(0, 20)
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -32, 0, 58)
-title.Position = UDim2.fromOffset(16, 10)
-title.BackgroundTransparency = 1
-title.Text = "WASHER PHONE"
-title.TextColor3 = Color3.fromRGB(220, 240, 255)
-title.TextSize = 24
-title.Font = Enum.Font.GothamBold
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = phone
-
-local jobsList = Instance.new("ScrollingFrame")
-jobsList.Position = UDim2.fromOffset(16, 70)
-jobsList.Size = UDim2.new(1, -32, 1, -142)
-jobsList.BackgroundTransparency = 1
-jobsList.BorderSizePixel = 0
-jobsList.CanvasSize = UDim2.new()
-jobsList.ScrollBarThickness = 5
-jobsList.Parent = phone
-
-local listLayout = Instance.new("UIListLayout")
-listLayout.Padding = UDim.new(0, 8)
-listLayout.Parent = jobsList
-listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-	jobsList.CanvasSize = UDim2.fromOffset(0, listLayout.AbsoluteContentSize.Y + 8)
-end)
-
-for _, jobID in SharedJobData.JobOrder do
-	local job = SharedJobData.Jobs[jobID]
-	local row = Instance.new("TextButton")
-	row.Name = jobID
-	row.Size = UDim2.new(1, -4, 0, 58)
-	row.BackgroundColor3 = Color3.fromRGB(43, 54, 75)
-	row.Text = string.format("%s  |  %s  |  $%d  |  ACCEPT", job.JobID, job.RequiredTier, job.Reward)
-	row.TextColor3 = Color3.fromRGB(240, 245, 255)
-	row.TextSize = 14
-	row.Font = Enum.Font.GothamMedium
-	row.Parent = jobsList
-	Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
-	row.Activated:Connect(function()
-		AcceptJobRequest:FireServer(jobID)
-	end)
+local function findTextLabel(root: Instance, preferredNames: {string}): TextLabel?
+	for _, name in preferredNames do
+		local candidate = root:FindFirstChild(name, true)
+		if candidate and candidate:IsA("TextLabel") then
+			return candidate
+		end
+	end
+	return root:FindFirstChildWhichIsA("TextLabel", true)
 end
 
-local quitButton = Instance.new("TextButton")
-quitButton.AnchorPoint = Vector2.new(0.5, 1)
-quitButton.Position = UDim2.new(0.5, 0, 1, -16)
-quitButton.Size = UDim2.new(1, -32, 0, 44)
-quitButton.BackgroundColor3 = Color3.fromRGB(135, 55, 62)
-quitButton.Text = "QUIT JOB  (-$50)"
-quitButton.TextColor3 = Color3.new(1, 1, 1)
-quitButton.TextSize = 15
-quitButton.Font = Enum.Font.GothamBold
-quitButton.Parent = phone
-Instance.new("UICorner", quitButton).CornerRadius = UDim.new(0, 10)
-quitButton.Activated:Connect(function()
-	QuitJobRequest:FireServer()
-end)
+local function findProgressFill(): Frame?
+	for _, name in { "ProgressFill", "Fill", "BarFill", "GreenFill" } do
+		local candidate = progressPanel:FindFirstChild(name, true)
+		if candidate and candidate:IsA("Frame") then
+			return candidate
+		end
+	end
 
-local progressPanel = Instance.new("Frame")
-progressPanel.Name = "JobProgress"
-progressPanel.AnchorPoint = Vector2.new(0, 1)
-progressPanel.Position = UDim2.new(0.025, 0, 0.95, 0)
-progressPanel.Size = UDim2.fromOffset(300, 76)
-progressPanel.BackgroundColor3 = Color3.fromRGB(20, 27, 37)
-progressPanel.Visible = false
-progressPanel.Parent = screenGui
-Instance.new("UICorner", progressPanel).CornerRadius = UDim.new(0, 12)
+	local track: Frame? = nil
+	for _, name in { "ProgressBar", "ProgressTrack", "Bar", "BarBackground" } do
+		local candidate = progressPanel:FindFirstChild(name, true)
+		if candidate and candidate:IsA("Frame") then
+			track = candidate
+			break
+		end
+	end
 
-local progressLabel = Instance.new("TextLabel")
-progressLabel.Position = UDim2.fromOffset(14, 8)
-progressLabel.Size = UDim2.new(1, -28, 0, 26)
-progressLabel.BackgroundTransparency = 1
-progressLabel.TextColor3 = Color3.fromRGB(235, 245, 255)
-progressLabel.TextSize = 15
-progressLabel.Font = Enum.Font.GothamBold
-progressLabel.TextXAlignment = Enum.TextXAlignment.Left
-progressLabel.Parent = progressPanel
+	-- Support unnamed manually-authored bars by choosing the widest, thinnest
+	-- Frame inside JobProgress. The root progress panel itself is excluded.
+	if track == nil then
+		local bestScore = 0
+		for _, descendant in progressPanel:GetDescendants() do
+			if descendant:IsA("Frame") and descendant.AbsoluteSize.Y > 0 then
+				local score = descendant.AbsoluteSize.X / descendant.AbsoluteSize.Y
+				if score > bestScore and score >= 4 then
+					bestScore = score
+					track = descendant
+				end
+			end
+		end
+	end
 
-local progressTrack = Instance.new("Frame")
-progressTrack.Position = UDim2.fromOffset(14, 44)
-progressTrack.Size = UDim2.new(1, -28, 0, 18)
-progressTrack.BackgroundColor3 = Color3.fromRGB(56, 65, 79)
-progressTrack.Parent = progressPanel
-Instance.new("UICorner", progressTrack).CornerRadius = UDim.new(1, 0)
+	if track == nil then
+		return nil
+	end
 
-local progressFill = Instance.new("Frame")
-progressFill.Size = UDim2.fromScale(0, 1)
-progressFill.BackgroundColor3 = Color3.fromRGB(91, 190, 255)
-progressFill.Parent = progressTrack
-Instance.new("UICorner", progressFill).CornerRadius = UDim.new(1, 0)
+	-- Keep the existing gray bar as a track and insert only the missing fill.
+	track.ClipsDescendants = true
+	local fill = Instance.new("Frame")
+	fill.Name = "ProgressFill"
+	fill.AnchorPoint = Vector2.zero
+	fill.Position = UDim2.fromScale(0, 0)
+	fill.Size = UDim2.fromScale(1, 1)
+	fill.BorderSizePixel = 0
+	fill.BackgroundColor3 = Color3.fromRGB(35, 112, 65)
+	fill.ZIndex = track.ZIndex + 1
+	fill.Parent = track
+	local trackCorner = track:FindFirstChildWhichIsA("UICorner")
+	if trackCorner then
+		trackCorner:Clone().Parent = fill
+	end
+	return fill
+end
+
+local progressLabel = findTextLabel(progressPanel, { "ProgressText", "ProgressLabel", "TextLabel" })
+local progressFill = findProgressFill()
+local progressFillFullSize = if progressFill then progressFill.Size else nil
+local LOW_PROGRESS_GREEN = Color3.fromRGB(35, 112, 65)
+local HIGH_PROGRESS_GREEN = Color3.fromRGB(67, 238, 119)
+local JOB_COMPLETION_FRACTION = 0.9
+local targetProgressFraction = 0
+local displayedProgressFraction = 0
+
+if progressFill == nil then
+	warn("JobUI.JobProgress needs a horizontal progress bar Frame.")
+end
+
+local function jobIDForButton(button: GuiButton): string?
+	local attribute = button:GetAttribute("JobID")
+	if typeof(attribute) == "string" and SharedJobData.Jobs[attribute] ~= nil then
+		return attribute
+	end
+
+	if SharedJobData.Jobs[button.Name] ~= nil then
+		return button.Name
+	end
+
+	local buttonText = if button:IsA("TextButton") then button.Text else ""
+	for _, jobID in SharedJobData.JobOrder do
+		if string.find(button.Name, jobID, 1, true) or string.find(buttonText, jobID, 1, true) then
+			return jobID
+		end
+	end
+	return nil
+end
+
+local quitButton: GuiButton? = nil
+for _, descendant in phoneMenu:GetDescendants() do
+	if descendant:IsA("GuiButton") then
+		local action = descendant:GetAttribute("Action")
+		local lowerName = string.lower(descendant.Name)
+		local lowerText = if descendant:IsA("TextButton") then string.lower(descendant.Text) else ""
+		-- A manually authored button named exactly "Quit" is supported, as is
+		-- any GuiButton carrying the string attribute Action = "QuitJob".
+		if descendant.Name == "Quit"
+			or action == "QuitJob"
+			or string.find(lowerName, "quit", 1, true)
+			or string.find(lowerText, "quit", 1, true)
+		then
+			quitButton = descendant
+		else
+			local jobID = jobIDForButton(descendant)
+			if jobID ~= nil then
+				descendant.Activated:Connect(function()
+					AcceptJobRequest:FireServer(jobID)
+				end)
+			end
+		end
+	end
+end
+
+if quitButton then
+	quitButton.Activated:Connect(function()
+		QuitJobRequest:FireServer()
+	end)
+else
+	warn("JobUI.PhoneMenu needs a GuiButton named with 'Quit' or Action='QuitJob'")
+end
 
 local function updateProgress()
 	if activeJobID == nil or totalSegments <= 0 then
@@ -151,16 +248,39 @@ local function updateProgress()
 	end
 
 	local fraction = math.clamp(currentCleaned / totalSegments, 0, 1)
-	progressLabel.Text = string.format("%s  •  %d / %d", activeJobID, currentCleaned, totalSegments)
-	progressFill.Size = UDim2.fromScale(fraction, 1)
+	targetProgressFraction = fraction
+	if progressLabel then
+		progressLabel.Text = string.format("%s  -  %.1f%% CLEAN", activeJobID, fraction * 100)
+	end
 end
 
+RunService.RenderStepped:Connect(function(deltaTime)
+	if progressFill and progressFillFullSize then
+		-- Exponential smoothing continues toward the newest target even when
+		-- dozens of cleaning updates arrive in the same frame.
+		local smoothing = 1 - math.exp(-12 * deltaTime)
+		displayedProgressFraction += (targetProgressFraction - displayedProgressFraction) * smoothing
+		if math.abs(targetProgressFraction - displayedProgressFraction) < 0.0005 then
+			displayedProgressFraction = targetProgressFraction
+		end
+		local brightnessProgress = math.clamp(displayedProgressFraction / JOB_COMPLETION_FRACTION, 0, 1)
+		local targetSize = UDim2.new(
+			progressFillFullSize.X.Scale * displayedProgressFraction,
+			math.round(progressFillFullSize.X.Offset * displayedProgressFraction),
+			progressFillFullSize.Y.Scale,
+			progressFillFullSize.Y.Offset
+		)
+		progressFill.Size = targetSize
+		progressFill.BackgroundColor3 = LOW_PROGRESS_GREEN:Lerp(HIGH_PROGRESS_GREEN, brightnessProgress)
+	end
+end)
+
 local function clearWaypoint()
-	if waypointConnection ~= nil then
+	if waypointConnection then
 		waypointConnection:Disconnect()
 		waypointConnection = nil
 	end
-	if waypointFolder ~= nil then
+	if waypointFolder then
 		waypointFolder:Destroy()
 		waypointFolder = nil
 	end
@@ -169,7 +289,8 @@ end
 local function createWaypoint(jobID: string)
 	clearWaypoint()
 
-	local jobSites = workspace:FindFirstChild("JobSites")
+	local environment = Workspace:FindFirstChild("EnvironmentFixtures")
+	local jobSites = environment and environment:FindFirstChild("JobSites")
 	local site = jobSites and jobSites:FindFirstChild(jobID)
 	if site == nil then
 		return
@@ -187,7 +308,7 @@ local function createWaypoint(jobID: string)
 
 	local folder = Instance.new("Folder")
 	folder.Name = "LocalJobWaypoint"
-	folder.Parent = workspace
+	folder.Parent = Workspace
 	waypointFolder = folder
 
 	local startPart = Instance.new("Part")
@@ -218,24 +339,6 @@ local function createWaypoint(jobID: string)
 	beam.Segments = 8
 	beam.Parent = folder
 
-	local marker = Instance.new("BillboardGui")
-	marker.Name = "LocalJobSiteMarker"
-	marker.Adornee = sitePart
-	marker.AlwaysOnTop = true
-	marker.Size = UDim2.fromOffset(130, 44)
-	marker.StudsOffsetWorldSpace = Vector3.new(0, 4, 0)
-	marker.Parent = folder
-
-	local markerLabel = Instance.new("TextLabel")
-	markerLabel.Size = UDim2.fromScale(1, 1)
-	markerLabel.BackgroundColor3 = Color3.fromRGB(35, 90, 130)
-	markerLabel.BackgroundTransparency = 0.2
-	markerLabel.TextColor3 = Color3.new(1, 1, 1)
-	markerLabel.TextSize = 14
-	markerLabel.Font = Enum.Font.GothamBold
-	markerLabel.Parent = marker
-	Instance.new("UICorner", markerLabel).CornerRadius = UDim.new(0, 8)
-
 	waypointConnection = RunService.RenderStepped:Connect(function()
 		local character = player.Character
 		local root = character and character:FindFirstChild("HumanoidRootPart")
@@ -243,20 +346,17 @@ local function createWaypoint(jobID: string)
 			return
 		end
 
-		local startPosition = Vector3.new(root.Position.X, 0.25, root.Position.Z)
-		local endPosition = Vector3.new(sitePart.Position.X, 0.25, sitePart.Position.Z)
-		startPart.Position = startPosition
-		endPart.Position = endPosition
+		startPart.Position = Vector3.new(root.Position.X, 0.25, root.Position.Z)
+		endPart.Position = Vector3.new(sitePart.Position.X, 0.25, sitePart.Position.Z)
 		beam.Transparency = NumberSequence.new(0.32 + math.sin(os.clock() * 2) * 0.1)
-		markerLabel.Text = string.format("JOB SITE\n%d studs", math.floor((root.Position - sitePart.Position).Magnitude))
 	end)
 end
 
 openPhoneButton.Activated:Connect(function()
-	phone.Visible = not phone.Visible
+	phoneMenu.Visible = not phoneMenu.Visible
 end)
 
-progressSignal.Event:Connect(function()
+predictedProgressEvent.Event:Connect(function()
 	if activeJobID == nil then
 		return
 	end
@@ -273,10 +373,12 @@ JobStateChanged.OnClientEvent:Connect(function(state)
 		activeJobID = state.JobID
 		currentCleaned = state.SegmentsCleaned or 0
 		totalSegments = state.TotalSegments or 0
+		targetProgressFraction = 0
+		displayedProgressFraction = 0
 		progressPanel.Visible = true
-		phone.Visible = false
+		phoneMenu.Visible = false
 		updateProgress()
-		createWaypoint(activeJobID)
+		createWaypoint(activeJobID :: string)
 	elseif state.State == "Progress" and state.JobID == activeJobID then
 		currentCleaned = state.SegmentsCleaned or currentCleaned
 		totalSegments = state.TotalSegments or totalSegments
@@ -285,6 +387,8 @@ JobStateChanged.OnClientEvent:Connect(function(state)
 		activeJobID = nil
 		currentCleaned = 0
 		totalSegments = 0
+		targetProgressFraction = 0
+		displayedProgressFraction = 0
 		progressPanel.Visible = false
 		clearWaypoint()
 	end

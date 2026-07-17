@@ -6,14 +6,21 @@
 
 local Players = game:GetService("Players")
 
+-- Bootstrap shared runtime dependencies before requiring modules whose top
+-- level code waits for these folders and RemoteEvents.
+local ReplicatedStorageBootstrapper = require(script:WaitForChild("ReplicatedStorageBootstrapper"))
+ReplicatedStorageBootstrapper:Init()
+
+-- Build the physical development world before loading ProfileService or any
+-- gameplay dependency. A later module error must not prevent the map existing.
+local DevEnvironmentSetup = require(script:WaitForChild("DevEnvironmentSetup"))
+DevEnvironmentSetup:Init()
+
 local DataManager = require(script:WaitForChild("DataManager"))
 local CollisionManager = require(script:WaitForChild("CollisionManager"))
 local JobManager = require(script:WaitForChild("JobManager"))
 local WasherServer = require(script:WaitForChild("WasherServer"))
-local WasherTestFixture = require(script:WaitForChild("WasherTestFixture"))
-local VehicleTestFixture = require(script:WaitForChild("VehicleTestFixture"))
-local VehicleManager = require(script:WaitForChild("VehicleManager"))
-local ShopTestFixture = require(script:WaitForChild("ShopTestFixture"))
+local EquipmentManager = require(script:WaitForChild("EquipmentManager"))
 local ShopServer = require(script:WaitForChild("ShopServer"))
 local MonetizationManager = require(script:WaitForChild("MonetizationManager"))
 local PetServer = require(script:WaitForChild("PetServer"))
@@ -22,10 +29,7 @@ CollisionManager:Init()
 JobManager:Init()
 MonetizationManager:Init()
 WasherServer:Init()
-WasherTestFixture:Init()
-VehicleTestFixture:Init()
-VehicleManager:Init()
-ShopTestFixture:Init()
+EquipmentManager:Init()
 ShopServer:Init()
 PetServer:Init()
 
@@ -53,6 +57,7 @@ local function onPlayerAdded(player: Player)
 			-- Native leaderboard values are created only after the authoritative
 			-- profile has loaded. Water and equipment stay out of leaderstats.
 			createLeaderstats(player, profile.Data.Cash)
+			EquipmentManager:EquipPlayer(player)
 		elseif player.Parent ~= nil then
 			-- Do not reveal whether another server has this profile open.
 			-- The generic message is safer and clearer for players.
