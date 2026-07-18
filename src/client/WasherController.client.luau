@@ -26,6 +26,7 @@ local PIXEL_CLEAN_POWER = 20
 local PIXEL_BRUSH_RADIUS = 3
 local DIRT_IMAGE_SIZE = Vector2.new(512, 768)
 local DIRT_BRUSH_RADIUS = 28
+local BASE_WORLD_BRUSH_RADIUS = 0.55
 local FULL_PRESSURE_DISTANCE = 12
 local PRESSURE_FALLOFF_DISTANCE = 70
 local MIN_PRESSURE_MULTIPLIER = 0.2
@@ -116,10 +117,16 @@ local function initializeHighResolutionDirt()
 	local environment = Workspace:WaitForChild("EnvironmentFixtures", 15)
 	local jobSites = environment and environment:WaitForChild("JobSites", 15)
 	local benchSite = jobSites and jobSites:WaitForChild("Bench_1", 15)
-	local drivewayInstance = benchSite and benchSite:WaitForChild("Driveway", 15)
+	local drivewayInstance = benchSite and benchSite:FindFirstChild("Driveway")
 	local dirtPixels = benchSite and benchSite:WaitForChild("DirtPixels", 15)
-	if drivewayInstance == nil or not drivewayInstance:IsA("BasePart") or dirtPixels == nil then
-		warn("High-resolution dirt mask could not find the development driveway.")
+	if drivewayInstance == nil then
+		-- The real Blender bench uses many small surface-aligned dirt patches;
+		-- the EditableImage canvas remains the flat-driveway fallback only.
+		print("DIAGNOSTIC: Using 3D bench dirt patches instead of the flat EditableImage canvas.")
+		return
+	end
+	if not drivewayInstance:IsA("BasePart") or dirtPixels == nil then
+		warn("High-resolution dirt mask found an invalid development driveway.")
 		return
 	end
 
@@ -535,7 +542,55 @@ local function gatherDirtPixels(
 	return pixels
 end
 
-local function findDirtSegments(hitInstance: Instance, hitPosition: Vector3, brushRadius: number): {Instance}
+local function findBenchDirtFolder(instance: Instance): Instance?
+	if instance:GetAttribute("DirtPatch") == true then
+		return instance.Parent
+	end
+
+	local ancestor: Instance? = instance
+	while ancestor ~= nil and ancestor ~= Workspace do
+		if ancestor:GetAttribute("CleanableJobModel") == true then
+			return ancestor:FindFirstChild("DirtPixels")
+		end
+		ancestor = ancestor.Parent
+	end
+	return nil
+end
+
+local function gatherNearbyDirtPatches(folder: Instance, hitPosition: Vector3, worldRadius: number): {Instance}
+	local patches: {Instance} = {}
+	for _, candidate in folder:GetChildren() do
+		if candidate:IsA("BasePart")
+			and candidate:GetAttribute("DirtPatch") == true
+			and CollectionService:HasTag(candidate, DIRT_TAG)
+			and (candidate.Position - hitPosition).Magnitude <= worldRadius
+		then
+			table.insert(patches, candidate)
+		end
+	end
+	return patches
+end
+
+local function findDirtSegments(
+	hitInstance: Instance,
+	hitPosition: Vector3,
+	brushRadius: number,
+	worldBrushRadius: number
+): {Instance}
+	if hitInstance:GetAttribute("DirtPatch") == true then
+		local patchFolder = findBenchDirtFolder(hitInstance)
+		if patchFolder ~= nil then
+			return gatherNearbyDirtPatches(patchFolder, hitPosition, worldBrushRadius)
+		end
+	end
+
+	if hitInstance:GetAttribute("BenchCleanableSurface") == true then
+		local patchFolder = findBenchDirtFolder(hitInstance)
+		if patchFolder ~= nil then
+			return gatherNearbyDirtPatches(patchFolder, hitPosition, worldBrushRadius)
+		end
+	end
+
 	if hitInstance:IsA("BasePart") and hitInstance:GetAttribute("DirtPixel") == true then
 		local centerRow = hitInstance:GetAttribute("DirtRow")
 		local centerColumn = hitInstance:GetAttribute("DirtColumn")
@@ -794,8 +849,9 @@ RunService.RenderStepped:Connect(function(deltaTime)
 	local pressureMultiplier = getPressureMultiplier(offset.Magnitude)
 	local brushScale = 1 + (1 - pressureMultiplier) * 1.25
 	local logicalBrushRadius = math.max(PIXEL_BRUSH_RADIUS, math.round(PIXEL_BRUSH_RADIUS * brushScale))
+	local worldBrushRadius = BASE_WORLD_BRUSH_RADIUS * brushScale
 	local segments = if cursorResult
-		then findDirtSegments(cursorResult.Instance, cursorResult.Position, logicalBrushRadius)
+		then findDirtSegments(cursorResult.Instance, cursorResult.Position, logicalBrushRadius, worldBrushRadius)
 		else {}
 	local representativeSegment = segments[1]
 	if cursorResult ~= nil then
@@ -829,7 +885,7 @@ RunService.RenderStepped:Connect(function(deltaTime)
 	if cursorResult ~= nil and cursorResult.Instance:GetAttribute("DirtPixel") == true and not loggedDrivewayTarget then
 		loggedDrivewayTarget = true
 		print(string.format(
-			"DIAGNOSTIC: Washer cursor hit exact dirt pixel at %s and resolved %d brush pixels.",
+			"DIAGNOSTIC: Washer cursor hit an exact dirt region at %s and resolved %d nearby regions.",
 			tostring(cursorResult.Position),
 			#segments
 		))

@@ -16,6 +16,9 @@ ReplicatedStorageBootstrapper:Init()
 local DevEnvironmentSetup = require(script:WaitForChild("DevEnvironmentSetup"))
 DevEnvironmentSetup:Init()
 
+local BenchJobSetup = require(script:WaitForChild("BenchJobSetup"))
+BenchJobSetup:Init()
+
 local DataManager = require(script:WaitForChild("DataManager"))
 local CollisionManager = require(script:WaitForChild("CollisionManager"))
 local JobManager = require(script:WaitForChild("JobManager"))
