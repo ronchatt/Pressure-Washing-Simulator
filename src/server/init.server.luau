@@ -5,6 +5,8 @@
 -- directly from RemoteEvents.
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local DEVELOPMENT_USER_ID = 151636877
 
 -- Bootstrap shared runtime dependencies before requiring modules whose top
 -- level code waits for these folders and RemoteEvents.
@@ -21,20 +23,30 @@ BenchJobSetup:Init()
 
 local DataManager = require(script:WaitForChild("DataManager"))
 local CollisionManager = require(script:WaitForChild("CollisionManager"))
+local BaseHubManager = require(script:WaitForChild("BaseHubManager"))
+local VehicleManager = require(script:WaitForChild("VehicleManager"))
+local GlobalLeaderboardManager = require(script:WaitForChild("GlobalLeaderboardManager"))
 local JobManager = require(script:WaitForChild("JobManager"))
 local WasherServer = require(script:WaitForChild("WasherServer"))
 local EquipmentManager = require(script:WaitForChild("EquipmentManager"))
 local ShopServer = require(script:WaitForChild("ShopServer"))
 local MonetizationManager = require(script:WaitForChild("MonetizationManager"))
 local PetServer = require(script:WaitForChild("PetServer"))
+local WaterEconomyManager = require(script:WaitForChild("WaterEconomyManager"))
+local TutorialServer = require(script:WaitForChild("TutorialServer"))
 
 CollisionManager:Init()
+BaseHubManager:Init()
+VehicleManager:Init()
 JobManager:Init()
 MonetizationManager:Init()
 WasherServer:Init()
 EquipmentManager:Init()
 ShopServer:Init()
 PetServer:Init()
+WaterEconomyManager:Init()
+TutorialServer:Init()
+GlobalLeaderboardManager:Init()
 
 local function createLeaderstats(player: Player, cash: number)
 	if player.Parent == nil then
@@ -57,6 +69,18 @@ local function onPlayerAdded(player: Player)
 		local profile, loadError = DataManager:LoadProfile(player)
 
 		if profile ~= nil then
+			-- One-time development grant requested by the owner. It is restricted
+			-- to their exact account in Studio and records its claimed state in the
+			-- profile so repeated test sessions cannot duplicate the cash.
+			if RunService:IsStudio()
+				and player.UserId == DEVELOPMENT_USER_ID
+				and profile.Data.DevelopmentGrants.Cash100kV1 ~= true
+			then
+				if DataManager:AddCash(player, 100_000) then
+					profile.Data.DevelopmentGrants.Cash100kV1 = true
+					print("DEVELOPMENT: Granted RC_StudiosYT $100,000 test cash.")
+				end
+			end
 			-- Native leaderboard values are created only after the authoritative
 			-- profile has loaded. Water and equipment stay out of leaderstats.
 			createLeaderstats(player, profile.Data.Cash)

@@ -5,9 +5,13 @@
 
 local MarketplaceService = game:GetService("MarketplaceService")
 local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local INFINITE_WATER_ID = 1111111
 local DOUBLE_SPEED_ID = 2222222
+local BASE_WALK_SPEED = 16
+local SPRINT_MULTIPLIER = 1.5
+local SprintStateRequest = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SprintStateRequest") :: RemoteEvent
 
 local MonetizationManager = {}
 local initialized = false
@@ -28,18 +32,16 @@ end
 
 local function applyWalkSpeed(player: Player, character: Model?)
 	local cached = ownership[player]
-	if cached == nil or not cached.DoubleSpeed then
-		return
-	end
-
 	local targetCharacter = character or player.Character
 	local humanoid = targetCharacter and targetCharacter:FindFirstChildOfClass("Humanoid")
 	if humanoid ~= nil then
+		local gamepassMultiplier = if cached ~= nil and cached.DoubleSpeed then 2 else 1
 		local petMultiplier = player:GetAttribute("PetSpeedMultiplier")
 		if typeof(petMultiplier) ~= "number" then
 			petMultiplier = 1
 		end
-		humanoid.WalkSpeed = 16 * 2 * petMultiplier
+		local sprintMultiplier = if player:GetAttribute("IsSprinting") == true then SPRINT_MULTIPLIER else 1
+		humanoid.WalkSpeed = BASE_WALK_SPEED * gamepassMultiplier * petMultiplier * sprintMultiplier
 	end
 end
 
@@ -59,8 +61,10 @@ end
 
 local function watchPlayer(player: Player)
 	ownership[player] = { InfiniteWater = false, DoubleSpeed = false }
+	player:SetAttribute("IsSprinting", false)
 	player.CharacterAdded:Connect(function(character)
 		character:WaitForChild("Humanoid")
+		player:SetAttribute("IsSprinting", false)
 		applyWalkSpeed(player, character)
 	end)
 
@@ -79,6 +83,10 @@ function MonetizationManager:OwnsDoubleSpeed(player: Player): boolean
 	return cached ~= nil and cached.DoubleSpeed
 end
 
+function MonetizationManager:ApplyWalkSpeed(player: Player, character: Model?)
+	applyWalkSpeed(player, character)
+end
+
 function MonetizationManager:Init()
 	if initialized then
 		return
@@ -92,6 +100,14 @@ function MonetizationManager:Init()
 	for _, player in Players:GetPlayers() do
 		watchPlayer(player)
 	end
+
+	SprintStateRequest.OnServerEvent:Connect(function(player, wantsToSprint)
+		if typeof(wantsToSprint) ~= "boolean" then
+			return
+		end
+		player:SetAttribute("IsSprinting", wantsToSprint)
+		applyWalkSpeed(player)
+	end)
 
 	MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player, gamepassId, wasPurchased)
 		if not wasPurchased then

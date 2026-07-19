@@ -12,14 +12,14 @@ local Workspace = game:GetService("Workspace")
 local DataManager = require(script.Parent:WaitForChild("DataManager"))
 local JobManager = require(script.Parent:WaitForChild("JobManager"))
 local MonetizationManager = require(script.Parent:WaitForChild("MonetizationManager"))
+local SharedShopData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SharedShopData"))
 
 local DIRT_TAG = "DirtSegment"
 -- Matches the client's 90-stud falloff range with a small allowance for the
 -- distance between HumanoidRootPart and the equipped nozzle.
 local MAX_CLEAN_DISTANCE = 95
-local TARGET_EMPTY_DURATION = 30
+local BASE_WATER_PER_SECOND = 100 / 30
 local WATER_REPORT_INTERVAL = 0.25
-local HYDRANT_REFILL_AMOUNT = 100
 
 local CleanSegmentRequest = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CleanSegmentRequest") :: RemoteEvent
 local SprayWaterRequest = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SprayWaterRequest") :: RemoteEvent
@@ -27,7 +27,14 @@ local SprayWaterRequest = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild
 local WasherServer = {}
 local initialized = false
 local lastWaterReport: {[Player]: number} = {}
-local recentValidSpray: {[Player]: {JobID: string, Timestamp: number}} = {}
+
+local function getWasherStats(player: Player)
+	local data = DataManager:GetData(player)
+	if data then
+		return SharedShopData.Washers[data.EquippedWasher] or SharedShopData.Washers["Basic Backpack"]
+	end
+	return SharedShopData.Washers["Basic Backpack"]
+end
 
 local function getWorldPosition(segment: Instance): Vector3?
 	if segment:IsA("BasePart") then
@@ -63,7 +70,8 @@ local function isValidCleaningRequest(player: Player, segment: Instance): boolea
 
 	-- JobID is authored on the server's segment model. It prevents a player
 	-- with an active job from claiming dirt belonging to a different job.
-	if segment:GetAttribute("JobID") ~= activeJob.JobID then
+	local segmentJobID = segment:GetAttribute("JobID")
+	if typeof(segmentJobID) ~= "string" or not JobManager:IsJobPartOfActive(player, segmentJobID) then
 		return false
 	end
 
@@ -74,7 +82,8 @@ local function isValidCleaningRequest(player: Player, segment: Instance): boolea
 	end
 
 	local segmentPosition = getWorldPosition(segment)
-	if segmentPosition == nil or (root.Position - segmentPosition).Magnitude > MAX_CLEAN_DISTANCE then
+	local washer = getWasherStats(player)
+	if segmentPosition == nil or (root.Position - segmentPosition).Magnitude > MAX_CLEAN_DISTANCE * washer.EffectiveRange then
 		return false
 	end
 
@@ -99,18 +108,11 @@ local function cleanSegment(player: Player, segment: Instance)
 		return
 	end
 
-	local recentSpray = recentValidSpray[player]
-	if recentSpray == nil
-		or recentSpray.JobID ~= segment:GetAttribute("JobID")
-		or os.clock() - recentSpray.Timestamp > 0.75
-	then
-		return
-	end
-
-	local completedJob = JobManager:RecordCleanedSegment(player, segment)
-	if completedJob ~= nil then
-		DataManager:AddCash(player, JobManager:GetRewardWithPetMultiplier(player, completedJob.Reward))
-	end
+	-- Distance, equipped tool, water, active job, and duplicate checks above are
+	-- the authoritative validation boundary. Requiring a separate heartbeat to
+	-- arrive first caused valid completion cells to be dropped permanently when
+	-- two reliable RemoteEvents reached the server in adjacent frames.
+	JobManager:RecordCleanedSegment(player, segment)
 end
 
 local function consumeSprayWater(player: Player, segment: Instance?)
@@ -135,36 +137,101 @@ local function consumeSprayWater(player: Player, segment: Instance?)
 	lastWaterReport[player] = now
 	-- A valid dirt target authorizes the later completion report. Water itself
 	-- is consumed whenever the equipped washer is spraying, including into air.
-	if segment ~= nil and isValidCleaningRequest(player, segment) then
-		local jobID = segment:GetAttribute("JobID")
-		if typeof(jobID) == "string" then
-			recentValidSpray[player] = { JobID = jobID, Timestamp = now }
-		end
-	end
-
 	if MonetizationManager:OwnsInfiniteWater(player) then
 		return
 	end
 
-	local waterPerSecond = data.MaxWater / TARGET_EMPTY_DURATION
+	local washer = getWasherStats(player)
+	local waterPerSecond = BASE_WATER_PER_SECOND / washer.WaterEfficiency
 	DataManager:DeductWater(player, waterPerSecond * WATER_REPORT_INTERVAL)
 end
 
-local function connectHydrantRefill()
+local function getObjectBounds(object: Instance): (CFrame?, Vector3?)
+	if object:IsA("Model") then
+		return object:GetBoundingBox()
+	elseif object:IsA("BasePart") then
+		return object.CFrame, object.Size
+	end
+	return nil, nil
+end
+
+local function placeHydrantNearJobs(hydrant: Model | BasePart)
 	local environment = Workspace:FindFirstChild("EnvironmentFixtures")
-	local base = environment and environment:FindFirstChild("Base")
-	local hydrant = base and base:FindFirstChild("FireHydrant")
-	local prompt = hydrant and hydrant:FindFirstChild("HydrantRefillPrompt", true)
-	if prompt == nil or not prompt:IsA("ProximityPrompt") then
-		warn("WasherServer could not find EnvironmentFixtures.Base.FireHydrant.HydrantRefillPrompt")
+	local jobSites = environment and environment:FindFirstChild("JobSites")
+	local bench = jobSites and jobSites:FindFirstChild("Bench_1")
+	local fence = jobSites and jobSites:FindFirstChild("Fence_1")
+	local benchCFrame = bench and select(1, getObjectBounds(bench))
+	local fenceCFrame = fence and select(1, getObjectBounds(fence))
+	if benchCFrame == nil and fenceCFrame == nil then
+		warn("WasherServer could not position the hydrant because Bench_1 and Fence_1 are unavailable")
 		return
 	end
 
-	prompt.Triggered:Connect(function(player)
-		if DataManager:RefillWater(player, HYDRANT_REFILL_AMOUNT) then
-			print(string.format("DIAGNOSTIC: Refilled %s's water to %d at the fire hydrant.", player.Name, HYDRANT_REFILL_AMOUNT))
+	local center: Vector3
+	local outward: Vector3
+	if benchCFrame ~= nil and fenceCFrame ~= nil then
+		center = (benchCFrame.Position + fenceCFrame.Position) * 0.5
+		local between = fenceCFrame.Position - benchCFrame.Position
+		local flatBetween = Vector3.new(between.X, 0, between.Z)
+		outward = if flatBetween.Magnitude > 0.1
+			then Vector3.new(-flatBetween.Z, 0, flatBetween.X).Unit
+			else Vector3.xAxis
+	else
+		local availableCFrame = benchCFrame or fenceCFrame
+		center = (availableCFrame :: CFrame).Position
+		outward = Vector3.xAxis
+	end
+
+	local boundsCFrame, boundsSize = getObjectBounds(hydrant)
+	if boundsCFrame == nil or boundsSize == nil then
+		return
+	end
+	local desiredCenter = Vector3.new(center.X, boundsSize.Y * 0.5, center.Z) + outward * 6
+	local translation = desiredCenter - boundsCFrame.Position
+	hydrant:PivotTo(hydrant:GetPivot() + translation)
+end
+
+local function connectHydrantRefill()
+	local hydrant = Workspace:FindFirstChild("Fire Hydrant", true)
+	if hydrant == nil or (not hydrant:IsA("Model") and not hydrant:IsA("BasePart")) then
+		warn("WasherServer could not find a movable Workspace['Fire Hydrant'] Model or BasePart")
+		return
+	end
+
+	for _, descendant in hydrant:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			descendant.Anchored = true
 		end
-	end)
+	end
+	if hydrant:IsA("BasePart") then
+		hydrant.Anchored = true
+	end
+	placeHydrantNearJobs(hydrant)
+
+	local promptParent = if hydrant:IsA("BasePart")
+		then hydrant
+		else hydrant.PrimaryPart or hydrant:FindFirstChildWhichIsA("BasePart", true)
+	if promptParent == nil then
+		warn("Workspace['Fire Hydrant'] has no BasePart for its refill prompt")
+		return
+	end
+	local existingPrompt = hydrant:FindFirstChild("HydrantRefillPrompt", true)
+	local prompt: ProximityPrompt
+	if existingPrompt ~= nil and existingPrompt:IsA("ProximityPrompt") then
+		prompt = existingPrompt
+	else
+		prompt = Instance.new("ProximityPrompt")
+		prompt.Name = "HydrantRefillPrompt"
+		prompt.Parent = promptParent
+	end
+	prompt.ActionText = "Refill Water"
+	prompt.ObjectText = "Fire Hydrant"
+	prompt.KeyboardKeyCode = Enum.KeyCode.E
+	prompt.HoldDuration = 2
+	prompt.MaxActivationDistance = 10
+	prompt.RequiresLineOfSight = false
+
+	print("WasherServer: moved and linked Workspace['Fire Hydrant'] beside the bench and fence.")
 end
 
 function WasherServer:Init()
@@ -199,7 +266,6 @@ function WasherServer:Init()
 
 	Players.PlayerRemoving:Connect(function(player)
 		lastWaterReport[player] = nil
-		recentValidSpray[player] = nil
 	end)
 end
 

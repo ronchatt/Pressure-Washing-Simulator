@@ -2,8 +2,8 @@
 
 print("DIAGNOSTIC: DevEnvironmentSetup script is RUNNING.")
 
--- Centralized development fixtures for testing jobs, the shop, and pets.
--- Vehicle models and parking-placeholder blocks are intentionally excluded.
+-- Centralized development fixtures for testing jobs and pets. The shop desk
+-- and fire hydrant are artist-authored Workspace models and are never cloned.
 
 local CollectionService = game:GetService("CollectionService")
 local Workspace = game:GetService("Workspace")
@@ -33,117 +33,44 @@ local function replaceChild(parent: Instance, name: string)
 	end
 end
 
-local function createGrassBaseplate(environment: Folder)
+local function configurePersistentFixtures(environment: Folder)
 	local success, creationError = pcall(function()
-		-- Rojo does not necessarily delete an unmanaged template Baseplate from
-		-- the open Studio place. Remove copies to prevent surface z-fighting.
-		for _, child in Workspace:GetChildren() do
-			if child.Name == "Baseplate" and child ~= environment then
-				child:Destroy()
+		-- Rojo owns Workspace.Baseplate so it is visible before Play. These
+		-- assignments are a runtime fallback for places that have not resynced.
+		local baseplate = Workspace:FindFirstChild("Baseplate")
+		if baseplate == nil or not baseplate:IsA("BasePart") then
+			if baseplate then
+				baseplate:Destroy()
 			end
+			baseplate = Instance.new("Part")
+			baseplate.Name = "Baseplate"
+			baseplate.Parent = Workspace
 		end
-
-		replaceChild(environment, "Baseplate")
-		local baseplate = Instance.new("Part")
-		baseplate.Name = "Baseplate"
 		baseplate.Size = Vector3.new(2048, 20, 2048)
 		baseplate.Position = Vector3.new(0, -10, 0)
 		baseplate.Anchored = true
 		baseplate.Color = Color3.fromRGB(99, 121, 57)
 		baseplate.Material = Enum.Material.Grass
 		baseplate.Locked = true
-		baseplate.Parent = environment
+
+		-- Purge objects made by the obsolete interaction-fixture generator.
+		local legacyBaseplate = environment:FindFirstChild("Baseplate")
+		if legacyBaseplate then
+			legacyBaseplate:Destroy()
+		end
+		local base = ensureFolder(environment, "Base")
+		for _, legacyName in { "Computer", "FireHydrant", "WaterStation", "EggIncubator" } do
+			local legacy = base:FindFirstChild(legacyName)
+			if legacy then
+				legacy:Destroy()
+			end
+		end
 	end)
 	if success then
-		print("DIAGNOSTIC: Created Baseplate successfully.")
+		print("DIAGNOSTIC: Persistent grass baseplate configured; legacy shop and hydrant removed.")
 	else
-		warn("DIAGNOSTIC: Failed to create Baseplate", creationError)
+		warn("DIAGNOSTIC: Failed to configure persistent fixtures", creationError)
 	end
-end
-
-local function createInteractionFixtures(environment: Folder)
-	local base = ensureFolder(environment, "Base")
-	replaceChild(base, "Computer")
-	replaceChild(base, "EggIncubator")
-	replaceChild(base, "FireHydrant")
-
-	local computerCreated, computerError = pcall(function()
-		local computer = Instance.new("Part")
-		computer.Name = "Computer"
-		computer.Size = Vector3.new(4, 4, 2)
-		computer.Position = Vector3.new(0, 5, 10)
-		computer.Anchored = true
-		computer.Color = Color3.fromRGB(48, 145, 210)
-		computer.Material = Enum.Material.Metal
-		computer.Parent = base
-	end)
-	if computerCreated then
-		print("DIAGNOSTIC: Created Computer successfully.")
-	else
-		warn("DIAGNOSTIC: Failed to create Computer", computerError)
-	end
-
-	local incubatorCreated, incubatorError = pcall(function()
-		local incubator = Instance.new("Part")
-		incubator.Name = "EggIncubator"
-		incubator.Shape = Enum.PartType.Ball
-		incubator.Size = Vector3.new(4, 4, 4)
-		incubator.Position = Vector3.new(7, 5, 10)
-		incubator.Anchored = true
-		incubator.Color = Color3.fromRGB(255, 210, 93)
-		incubator.Material = Enum.Material.Neon
-		incubator.Parent = base
-	end)
-	if incubatorCreated then
-		print("DIAGNOSTIC: Created Incubator successfully.")
-	else
-		warn("DIAGNOSTIC: Failed to create Incubator", incubatorError)
-	end
-
-	local hydrant = Instance.new("Model")
-	hydrant.Name = "FireHydrant"
-	hydrant.Parent = base
-
-	local hydrantBody = Instance.new("Part")
-	hydrantBody.Name = "Body"
-	hydrantBody.Shape = Enum.PartType.Cylinder
-	hydrantBody.Size = Vector3.new(4, 2.4, 2.4)
-	hydrantBody.CFrame = CFrame.new(15, 2, -14) * CFrame.Angles(0, 0, math.rad(90))
-	hydrantBody.Anchored = true
-	hydrantBody.Color = Color3.fromRGB(204, 38, 43)
-	hydrantBody.Material = Enum.Material.Metal
-	hydrantBody.Parent = hydrant
-	hydrant.PrimaryPart = hydrantBody
-
-	local hydrantTop = Instance.new("Part")
-	hydrantTop.Name = "Top"
-	hydrantTop.Shape = Enum.PartType.Ball
-	hydrantTop.Size = Vector3.new(2.8, 1.4, 2.8)
-	hydrantTop.Position = Vector3.new(15, 4.1, -14)
-	hydrantTop.Anchored = true
-	hydrantTop.Color = Color3.fromRGB(232, 55, 55)
-	hydrantTop.Material = Enum.Material.Metal
-	hydrantTop.Parent = hydrant
-
-	local hydrantBase = Instance.new("Part")
-	hydrantBase.Name = "Base"
-	hydrantBase.Shape = Enum.PartType.Cylinder
-	hydrantBase.Size = Vector3.new(0.8, 3.2, 3.2)
-	hydrantBase.CFrame = CFrame.new(15, 0.45, -14) * CFrame.Angles(0, 0, math.rad(90))
-	hydrantBase.Anchored = true
-	hydrantBase.Color = Color3.fromRGB(155, 31, 35)
-	hydrantBase.Material = Enum.Material.Metal
-	hydrantBase.Parent = hydrant
-
-	local refillPrompt = Instance.new("ProximityPrompt")
-	refillPrompt.Name = "HydrantRefillPrompt"
-	refillPrompt.ActionText = "Refill Water"
-	refillPrompt.ObjectText = "Fire Hydrant"
-	refillPrompt.KeyboardKeyCode = Enum.KeyCode.E
-	refillPrompt.HoldDuration = 2
-	refillPrompt.MaxActivationDistance = 10
-	refillPrompt.RequiresLineOfSight = false
-	refillPrompt.Parent = hydrantBody
 end
 
 -- Square half-stud pixels provide a much smoother silhouette than the former
@@ -244,12 +171,11 @@ function DevEnvironmentSetup:Init()
 	end
 
 	local environment = ensureFolder(Workspace, "EnvironmentFixtures")
-	createGrassBaseplate(environment)
-	createInteractionFixtures(environment)
+	configurePersistentFixtures(environment)
 	createDrivewayDirt(environment)
 
 	Workspace:SetAttribute("DevEnvironmentSetupStatus", "Ready")
-	print("DevEnvironmentSetup: grass, shop, egg, and pixel-driveway fixtures are ready")
+	print("DevEnvironmentSetup: persistent grass, egg, and job-test fixtures are ready")
 end
 
 return DevEnvironmentSetup

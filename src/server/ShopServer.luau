@@ -8,6 +8,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 
 local DataManager = require(script.Parent:WaitForChild("DataManager"))
+local VehicleManager = require(script.Parent:WaitForChild("VehicleManager"))
 local SharedShopData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SharedShopData"))
 local EquipmentManager = require(script.Parent:WaitForChild("EquipmentManager"))
 
@@ -15,6 +16,8 @@ local remotes = ReplicatedStorage:WaitForChild("Remotes")
 local PurchaseItemRequest = remotes:WaitForChild("PurchaseItemRequest") :: RemoteEvent
 local EquipItemRequest = remotes:WaitForChild("EquipItemRequest") :: RemoteEvent
 local PurchaseTankRequest = remotes:WaitForChild("PurchaseTankRequest") :: RemoteEvent
+local ShopStateRequest = remotes:WaitForChild("ShopStateRequest") :: RemoteEvent
+local ShopStateChanged = remotes:WaitForChild("ShopStateChanged") :: RemoteEvent
 
 local ShopServer = {}
 local initialized = false
@@ -40,7 +43,7 @@ local function waitForData(player: Player)
 	return nil
 end
 
-local function syncWasherSpeed(player: Player)
+local function syncWasherStats(player: Player)
 	local data = DataManager:GetData(player)
 	if data == nil then
 		return
@@ -49,14 +52,34 @@ local function syncWasherSpeed(player: Player)
 	local washer = SharedShopData.Washers[data.EquippedWasher]
 	if washer ~= nil then
 		player:SetAttribute("WasherCleanSpeed", washer.CleanSpeed)
+		player:SetAttribute("WasherSprayWidth", washer.SprayWidth)
+		player:SetAttribute("WasherWaterEfficiency", washer.WaterEfficiency)
+		player:SetAttribute("WasherEffectiveRange", washer.EffectiveRange)
+		player:SetAttribute("EquippedWasher", data.EquippedWasher)
 	end
 end
 
+local function sendShopState(player: Player, notice: string?, success: boolean?)
+	local data = DataManager:GetData(player)
+	if data == nil then
+		return
+	end
+	ShopStateChanged:FireClient(player, {
+		OwnedWashers = table.clone(data.OwnedWashers),
+		EquippedWasher = data.EquippedWasher,
+		OwnedTrucks = table.clone(data.OwnedTrucks),
+		EquippedTruck = data.EquippedTruck,
+		Cash = data.Cash,
+		MaxWater = data.MaxWater,
+		Notice = notice,
+		Success = success,
+	})
+end
+
 local function ensureComputerPrompt()
-	local environment = Workspace:FindFirstChild("EnvironmentFixtures")
-	local base = environment and environment:FindFirstChild("Base")
-	local computer = base and base:FindFirstChild("Computer")
+	local computer = Workspace:FindFirstChild("Computer with desk", true)
 	if computer == nil then
+		warn("ShopServer could not find Workspace['Computer with desk']")
 		return
 	end
 
@@ -66,18 +89,27 @@ local function ensureComputerPrompt()
 	elseif computer:IsA("BasePart") then
 		promptParent = computer
 	end
-	if promptParent == nil or promptParent:FindFirstChild("ShopPrompt") ~= nil then
+	if promptParent == nil then
+		warn(string.format("Workspace.%s has no BasePart for its shop prompt", computer.Name))
 		return
 	end
 
-	local prompt = Instance.new("ProximityPrompt")
+	local existingPrompt = computer:FindFirstChild("ShopPrompt", true)
+	local prompt: ProximityPrompt
+	if existingPrompt ~= nil and existingPrompt:IsA("ProximityPrompt") then
+		prompt = existingPrompt
+	else
+		prompt = Instance.new("ProximityPrompt")
+		prompt.Name = "ShopPrompt"
+		prompt.Parent = promptParent
+	end
 	prompt.Name = "ShopPrompt"
 	prompt.ActionText = "Open Shop"
-	prompt.ObjectText = "Base Computer"
+	prompt.ObjectText = "Computer with desk"
 	prompt.KeyboardKeyCode = Enum.KeyCode.E
 	prompt.MaxActivationDistance = 10
 	prompt.RequiresLineOfSight = false
-	prompt.Parent = promptParent
+	print("ShopServer: linked shop functionality to Workspace['Computer with desk'].")
 end
 
 local function purchaseItem(player: Player, category: string, itemName: string)
@@ -88,16 +120,32 @@ local function purchaseItem(player: Player, category: string, itemName: string)
 
 	if category == "Washers" then
 		local item = SharedShopData.Washers[itemName]
-		if item == nil or contains(data.OwnedWashers, itemName) or not DataManager:DeductCash(player, item.Cost) then
+		if item == nil then
+			sendShopState(player, "That washer does not exist.", false)
+			return
+		end
+		if contains(data.OwnedWashers, itemName) then
+			sendShopState(player, itemName .. " is already owned.", false)
+			return
+		end
+		if item.RequiredWasher and not contains(data.OwnedWashers, item.RequiredWasher) then
+			sendShopState(player, "Buy " .. item.RequiredWasher .. " first.", false)
+			return
+		end
+		if not DataManager:DeductCash(player, item.Cost) then
+			sendShopState(player, "Not enough cash.", false)
 			return
 		end
 		table.insert(data.OwnedWashers, itemName)
+		sendShopState(player, itemName .. " purchased!", true)
 	elseif category == "Trucks" then
 		local item = SharedShopData.Trucks[itemName]
 		if item == nil or contains(data.OwnedTrucks, itemName) or not DataManager:DeductCash(player, item.Cost) then
+			sendShopState(player, "Truck purchase failed.", false)
 			return
 		end
 		table.insert(data.OwnedTrucks, itemName)
+		sendShopState(player, itemName .. " purchased!", true)
 	end
 end
 
@@ -109,10 +157,15 @@ local function equipItem(player: Player, category: string, itemName: string)
 
 	if category == "Washers" and SharedShopData.Washers[itemName] ~= nil and contains(data.OwnedWashers, itemName) then
 		data.EquippedWasher = itemName
-		syncWasherSpeed(player)
+		syncWasherStats(player)
 		EquipmentManager:EquipPlayer(player)
+		sendShopState(player, itemName .. " equipped!", true)
 	elseif category == "Trucks" and SharedShopData.Trucks[itemName] ~= nil and contains(data.OwnedTrucks, itemName) then
 		data.EquippedTruck = itemName
+		VehicleManager:RespawnIfSpawned(player)
+		sendShopState(player, itemName .. " equipped!", true)
+	else
+		sendShopState(player, "You do not own that item.", false)
 	end
 end
 
@@ -120,16 +173,19 @@ local function purchaseTank(player: Player, tankID: string)
 	local data = DataManager:GetData(player)
 	local tier = SharedShopData.Tanks[tankID]
 	if data == nil or tier == nil or data.MaxWater ~= tier.RequiredMaxWater then
+		sendShopState(player, "Tank tiers must be purchased in order.", false)
 		return
 	end
 
 	if not DataManager:DeductCash(player, tier.Cost) then
+		sendShopState(player, "Not enough cash.", false)
 		return
 	end
 
 	data.MaxWater = tier.NewMaxWater
 	data.Water = math.min(data.Water, data.MaxWater)
 	DataManager:SyncWater(player)
+	sendShopState(player, "Water tank upgraded!", true)
 end
 
 function ShopServer:Init()
@@ -142,14 +198,16 @@ function ShopServer:Init()
 	Players.PlayerAdded:Connect(function(player)
 		task.spawn(function()
 			if waitForData(player) ~= nil then
-				syncWasherSpeed(player)
+				syncWasherStats(player)
+				sendShopState(player)
 			end
 		end)
 	end)
 	for _, player in Players:GetPlayers() do
 		task.spawn(function()
 			if waitForData(player) ~= nil then
-				syncWasherSpeed(player)
+				syncWasherStats(player)
+				sendShopState(player)
 			end
 		end)
 	end
@@ -170,6 +228,10 @@ function ShopServer:Init()
 		if typeof(tankID) == "string" then
 			purchaseTank(player, tankID)
 		end
+	end)
+
+	ShopStateRequest.OnServerEvent:Connect(function(player)
+		sendShopState(player)
 	end)
 end
 

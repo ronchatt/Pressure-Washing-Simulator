@@ -7,6 +7,9 @@
       "Washers": {
         "$className": "Folder"
       },
+      "Vehicles": {
+        "$className": "Folder"
+      },
       "Shared": {
         "$path": "src/shared"
       },
@@ -28,6 +31,18 @@
         "JobStateChanged": {
           "$className": "RemoteEvent"
         },
+        "JobStateRequest": {
+          "$className": "RemoteEvent"
+        },
+        "TutorialStateRequest": {
+          "$className": "RemoteEvent"
+        },
+        "TutorialStateChanged": {
+          "$className": "RemoteEvent"
+        },
+        "TutorialCompleteRequest": {
+          "$className": "RemoteEvent"
+        },
         "PurchaseItemRequest": {
           "$className": "RemoteEvent"
         },
@@ -35,6 +50,18 @@
           "$className": "RemoteEvent"
         },
         "PurchaseTankRequest": {
+          "$className": "RemoteEvent"
+        },
+        "ShopStateRequest": {
+          "$className": "RemoteEvent"
+        },
+        "ShopStateChanged": {
+          "$className": "RemoteEvent"
+        },
+        "WaterRefillRequest": {
+          "$className": "RemoteEvent"
+        },
+        "WaterRefillResult": {
           "$className": "RemoteEvent"
         },
         "HatchEggRequest": {
@@ -50,6 +77,12 @@
           "$className": "RemoteEvent"
         },
         "PetInventoryRequest": {
+          "$className": "RemoteEvent"
+        },
+        "SprintStateRequest": {
+          "$className": "RemoteEvent"
+        },
+        "RespawnVehicleRequest": {
           "$className": "RemoteEvent"
         }
       }
@@ -72,6 +105,17 @@
     "Workspace": {
       "$properties": {
         "FilteringEnabled": true
+      },
+      "Baseplate": {
+        "$className": "Part",
+        "$properties": {
+          "Anchored": true,
+          "Color": [0.3882353, 0.4745098, 0.2235294],
+          "Locked": true,
+          "Material": "Grass",
+          "Position": [0, -10, 0],
+          "Size": [2048, 20, 2048]
+        }
       },
       "EnvironmentFixtures": {
         "$className": "Folder"

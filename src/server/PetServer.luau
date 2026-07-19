@@ -57,8 +57,7 @@ local function applyPetSpeed(player: Player)
 
 	local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
 	if humanoid ~= nil then
-		local gamepassMultiplier = MonetizationManager:OwnsDoubleSpeed(player) and 2 or 1
-		humanoid.WalkSpeed = 16 * gamepassMultiplier * speedMultiplier
+		MonetizationManager:ApplyWalkSpeed(player)
 	end
 end
 
@@ -75,10 +74,15 @@ local function syncInventory(player: Player)
 end
 
 local function ensureEggPrompt()
-	local environment = Workspace:FindFirstChild("EnvironmentFixtures")
-	local base = environment and environment:FindFirstChild("Base")
-	local incubator = base and base:FindFirstChild("EggIncubator")
+	local artistBase = Workspace:FindFirstChild("Base")
+	local incubator = artistBase and (artistBase:FindFirstChild("Egg") or artistBase:FindFirstChild("Egg holder"))
 	if incubator == nil then
+		local environment = Workspace:FindFirstChild("EnvironmentFixtures")
+		local fallbackBase = environment and environment:FindFirstChild("Base")
+		incubator = fallbackBase and fallbackBase:FindFirstChild("EggIncubator")
+	end
+	if incubator == nil then
+		warn("PetServer could not find Workspace.Base.Egg")
 		return
 	end
 
@@ -88,8 +92,16 @@ local function ensureEggPrompt()
 	elseif incubator:IsA("BasePart") then
 		promptParent = incubator
 	end
-	if promptParent == nil or promptParent:FindFirstChild("EggPrompt") ~= nil then
+	if promptParent == nil then
 		return
+	end
+	local existingPrompt = promptParent:FindFirstChild("EggPrompt")
+	if existingPrompt ~= nil and existingPrompt:IsA("ProximityPrompt") then
+		existingPrompt.ActionText = "Buy Egg"
+		existingPrompt.ObjectText = string.format("Pet Egg ($%d)", SharedPetData.EggCost)
+		return
+	elseif existingPrompt ~= nil then
+		existingPrompt:Destroy()
 	end
 
 	local prompt = Instance.new("ProximityPrompt")

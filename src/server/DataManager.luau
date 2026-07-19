@@ -11,6 +11,7 @@ local ProfileService = require(packages:WaitForChild("ProfileService"))
 
 export type PlayerData = {
 	Cash: number,
+	LifetimeCashEarned: number,
 	Water: number,
 	MaxWater: number,
 	EquippedWasher: string,
@@ -20,6 +21,10 @@ export type PlayerData = {
 	UnlockedJobTiers: {string},
 	OwnedPets: {string},
 	EquippedPet: string?,
+	TutorialCompleted: boolean,
+	DevelopmentGrants: {
+		Cash100kV1: boolean,
+	},
 	Settings: {
 		MusicVolume: number,
 		SFXVolume: number,
@@ -28,6 +33,7 @@ export type PlayerData = {
 
 local PROFILE_TEMPLATE: PlayerData = {
 	Cash = 0,
+	LifetimeCashEarned = 0,
 	-- Water is the current fill level; MaxWater is the backpack's capacity.
 	Water = 100,
 	MaxWater = 100,
@@ -38,6 +44,10 @@ local PROFILE_TEMPLATE: PlayerData = {
 	UnlockedJobTiers = { "Benches" },
 	OwnedPets = {},
 	EquippedPet = nil,
+	TutorialCompleted = false,
+	DevelopmentGrants = {
+		Cash100kV1 = false,
+	},
 	Settings = {
 		MusicVolume = 0.5,
 		SFXVolume = 0.5,
@@ -47,8 +57,12 @@ local PROFILE_TEMPLATE: PlayerData = {
 local PROFILE_STORE_NAME = "PressureWashingSimulator_PlayerData_v1"
 local PlayerProfileStore = ProfileService.GetProfileStore(PROFILE_STORE_NAME, PROFILE_TEMPLATE)
 
+local cashEarnedEvent = Instance.new("BindableEvent")
+cashEarnedEvent.Name = "LifetimeCashEarnedChanged"
+
 local DataManager = {
 	ProfileTemplate = PROFILE_TEMPLATE,
+	CashEarned = cashEarnedEvent.Event,
 }
 
 local profiles: {[Player]: any} = {}
@@ -159,6 +173,21 @@ function DataManager:AddCash(player: Player, amount: number): boolean
 	return true
 end
 
+function DataManager:AddEarnedCash(player: Player, amount: number): boolean
+	if not isValidAmount(amount) or amount <= 0 then
+		return false
+	end
+	local data = self:GetData(player)
+	if data == nil then
+		return false
+	end
+	data.Cash += amount
+	data.LifetimeCashEarned += amount
+	syncCashLeaderstat(player, data.Cash)
+	cashEarnedEvent:Fire(player, data.LifetimeCashEarned)
+	return true
+end
+
 function DataManager:DeductCash(player: Player, amount: number): boolean
 	if not isValidAmount(amount) or amount <= 0 then
 		return false
@@ -214,6 +243,39 @@ function DataManager:SyncWater(player: Player): boolean
 	end
 
 	syncWaterAttributes(player, data)
+	return true
+end
+
+function DataManager:UnlockJobTier(player: Player, tierName: string): boolean
+	if tierName == "" then
+		return false
+	end
+
+	local data = self:GetData(player)
+	if data == nil then
+		return false
+	end
+
+	for _, unlockedTier in data.UnlockedJobTiers do
+		if unlockedTier == tierName then
+			return true
+		end
+	end
+
+	table.insert(data.UnlockedJobTiers, tierName)
+	return true
+end
+
+function DataManager:IsTutorialCompleted(player: Player): boolean
+	local data = self:GetData(player)
+	return data ~= nil and data.TutorialCompleted == true
+end
+
+function DataManager:CompleteTutorial(player: Player): boolean
+	local data = self:GetData(player)
+	if data == nil then return false end
+	data.TutorialCompleted = true
+	player:SetAttribute("TutorialCompleted", true)
 	return true
 end
 

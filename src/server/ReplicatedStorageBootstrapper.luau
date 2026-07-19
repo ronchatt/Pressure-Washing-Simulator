@@ -29,14 +29,24 @@ local REMOTE_EVENT_NAMES = {
 	"AcceptJobRequest",
 	"QuitJobRequest",
 	"JobStateChanged",
+	"JobStateRequest",
+	"TutorialStateRequest",
+	"TutorialStateChanged",
+	"TutorialCompleteRequest",
 	"PurchaseItemRequest",
 	"EquipItemRequest",
 	"PurchaseTankRequest",
+	"ShopStateRequest",
+	"ShopStateChanged",
+	"WaterRefillRequest",
+	"WaterRefillResult",
 	"HatchEggRequest",
 	"PetHatched",
 	"EquipPetRequest",
 	"PetInventoryChanged",
 	"PetInventoryRequest",
+	"SprintStateRequest",
+	"RespawnVehicleRequest",
 }
 
 local ReplicatedStorageBootstrapper = {}
@@ -91,6 +101,7 @@ function ReplicatedStorageBootstrapper:Init()
 	end
 
 	ensureFolder(ReplicatedStorage, "Washers")
+	ensureFolder(ReplicatedStorage, "Vehicles")
 end
 
 return ReplicatedStorageBootstrapper

@@ -180,7 +180,7 @@ local function setEmptyAlertVisible(visible: boolean)
 	end
 end
 
-local EMPTY_TANK_SECONDS = 30
+local BASE_WATER_PER_SECOND = 100 / 30
 local predictedWater = 0
 local maxWater = 100
 local isSpraying = false
@@ -245,7 +245,9 @@ end)
 
 RunService.RenderStepped:Connect(function(deltaTime)
 	if isSpraying and player:GetAttribute("OwnsInfiniteWater") ~= true then
-		predictedWater = math.max(0, predictedWater - (maxWater / EMPTY_TANK_SECONDS) * deltaTime)
+		local configuredEfficiency = player:GetAttribute("WasherWaterEfficiency")
+		local efficiency = if typeof(configuredEfficiency) == "number" then math.max(configuredEfficiency, 0.1) else 1
+		predictedWater = math.max(0, predictedWater - (BASE_WATER_PER_SECOND / efficiency) * deltaTime)
 		render()
 	end
 end)
