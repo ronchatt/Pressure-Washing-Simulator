@@ -5,7 +5,9 @@
 -- or collections of BaseParts; exposed surfaces are discovered at runtime.
 
 local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
+local SharedJobData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SharedJobData"))
 
 local BenchJobSetup = {}
 local initialized = false
@@ -34,6 +36,7 @@ local DRIVEWAY_EARTH_INDICES = { 1, 2, 3, 6 }
 type JobConfig = {
 	SourceName: string,
 	JobID: string,
+	JobType: string,
 	RandomSeed: number,
 	PreferDarkest: boolean,
 	ExteriorOnly: boolean?,
@@ -50,6 +53,7 @@ type JobConfig = {
 	LiquidCanvas: boolean?,
 	FastFadeDuration: number?,
 	CleanPowerMultiplier: number?,
+	ResistanceMultiplier: number?,
 	TopSurfaceOnly: boolean?,
 	ContinuousCoverage: boolean?,
 	StyleAsConcrete: boolean?,
@@ -59,14 +63,17 @@ local JOB_CONFIGS: {JobConfig} = {
 	{
 		SourceName = "Bench",
 		JobID = "Bench_1",
+		JobType = "Bench",
 		RandomSeed = 731_041,
 		PreferDarkest = true,
-		FastFadeDuration = 0.055,
-		CleanPowerMultiplier = 1.7,
+		FastFadeDuration = 0.13,
+		CleanPowerMultiplier = 0.8,
+		ResistanceMultiplier = 1.5,
 	},
 	{
 		SourceName = "Fence",
 		JobID = "Fence_1",
+		JobType = "Fence",
 		RandomSeed = 918_227,
 		PreferDarkest = false,
 		FastFadeDuration = 0.055,
@@ -75,6 +82,7 @@ local JOB_CONFIGS: {JobConfig} = {
 	{
 		SourceName = "Stationary car",
 		JobID = "Car_1",
+		JobType = "Car",
 		RandomSeed = 482_771,
 		PreferDarkest = false,
 		ExteriorOnly = true,
@@ -88,12 +96,15 @@ local JOB_CONFIGS: {JobConfig} = {
 		ClusterThreshold = -0.12,
 		VisualTransparencyMin = 0.12,
 		VisualTransparencyMax = 0.3,
-		FastFadeDuration = 0.18,
-		CleanPowerMultiplier = 1.9,
+		FastFadeDuration = 0.22,
+		CleanPowerMultiplier = 1.5,
+		ResistanceMultiplier = 1.15,
+		LiquidCanvas = true,
 	},
 	{
 		SourceName = "Driveway",
 		JobID = "Driveway_1",
+		JobType = "Driveway",
 		RandomSeed = 347_119,
 		PreferDarkest = false,
 		TopSurfaceOnly = true,
@@ -110,6 +121,7 @@ local JOB_CONFIGS: {JobConfig} = {
 	{
 		SourceName = "house1",
 		JobID = "SingleStoryHouse_1",
+		JobType = "House",
 		RandomSeed = 604_913,
 		PreferDarkest = false,
 		ExteriorOnly = true,
@@ -198,6 +210,7 @@ local function findProductionCandidate(config: JobConfig): Instance?
 end
 
 local function convertToJobSite(candidate: Instance, jobSites: Folder, config: JobConfig): Model
+	local poolID = candidate:GetAttribute("JobPoolID")
 	local oldSite = jobSites:FindFirstChild(config.JobID)
 	if oldSite then
 		oldSite:Destroy()
@@ -214,8 +227,30 @@ local function convertToJobSite(candidate: Instance, jobSites: Folder, config: J
 	end
 	site.Name = config.JobID
 	site:SetAttribute("JobID", config.JobID)
+	site:SetAttribute("JobType", config.JobType)
+	if typeof(poolID) == "string" and poolID ~= "" then
+		site:SetAttribute("JobPoolID", poolID)
+		-- Pooled physical locations stay out of the phone catalog. The shared
+		-- contract selects one of them when the player accepts the job.
+		site:SetAttribute("PhoneJobEnabled", false)
+	else
+		site:SetAttribute("PhoneJobEnabled", true)
+	end
 	site:SetAttribute("CleanableJobModel", true)
 	site:SetAttribute("SourceModelName", config.SourceName)
+	local templateID = if typeof(poolID) == "string" and poolID ~= "" then poolID else config.JobID
+	local template = SharedJobData.Jobs[templateID]
+	local function setMetadata(name: string, fallback: any)
+		if site:GetAttribute(name) == nil and fallback ~= nil then
+			site:SetAttribute(name, fallback)
+		end
+	end
+	setMetadata("DisplayName", template and template.DisplayName or config.SourceName)
+	setMetadata("RequiredTier", template and template.RequiredTier or "Benches")
+	setMetadata("Difficulty", template and template.Difficulty or "Easy")
+	setMetadata("RecommendedWasher", template and template.RecommendedWasher or "Basic Backpack")
+	setMetadata("Reward", template and template.Reward or 50)
+	setMetadata("CompletionThreshold", template and template.CompletionThreshold or 95)
 
 	local largestPart: BasePart? = nil
 	local largestVolume = -1
@@ -442,9 +477,11 @@ local function createDirtPatches(site: Model, hits: {SurfaceHit}, step: number, 
 		-- client combines this with its distance pressure falloff.
 		local stubbornNoise = math.noise(hit.Position.X * 0.085, hit.Position.Z * 0.085, config.RandomSeed * 0.0001)
 		local isStubborn = config.ContinuousCoverage == true and stubbornNoise > 0.16
+		local resistanceMultiplier = config.ResistanceMultiplier or 1
 		patch:SetAttribute(
 			"DirtResistance",
-			if isStubborn then random:NextNumber(1.75, 2.35) else random:NextNumber(0.88, 1.16)
+			(if isStubborn then random:NextNumber(1.75, 2.35) else random:NextNumber(0.88, 1.16))
+				* resistanceMultiplier
 		)
 		patch:SetAttribute("StubbornDirt", isStubborn)
 		patch:SetAttribute("DirtWeight", math.clamp(patch.Size.Y * patch.Size.Z / (step * step), 1, 7))
@@ -511,6 +548,86 @@ local function createDirtPatches(site: Model, hits: {SurfaceHit}, step: number, 
 	site:SetAttribute("DirtPatchCount", #hits)
 end
 
+local function deterministicSeed(value: string): number
+	local hash = 17
+	for index = 1, #value do
+		hash = (hash * 31 + string.byte(value, index)) % 2_000_000_000
+	end
+	return hash
+end
+
+local function getPreset(jobType: string): JobConfig?
+	local requestedType = if jobType == "Mansion" then "House" else jobType
+	for _, config in JOB_CONFIGS do
+		if config.JobType == requestedType then
+			return config
+		end
+	end
+	return nil
+end
+
+local function makeAuthoredConfig(candidate: Instance, jobID: string, jobType: string): JobConfig?
+	local preset = getPreset(jobType)
+	if preset == nil then
+		return nil
+	end
+	local config = table.clone(preset) :: any
+	config.SourceName = candidate.Name
+	config.JobID = jobID
+	config.JobType = jobType
+	config.RandomSeed = deterministicSeed(jobID)
+	return config :: JobConfig
+end
+
+local function collectAuthoredCandidates(): {Instance}
+	local candidates: {Instance} = {}
+	for _, candidate in Workspace:GetDescendants() do
+		if (candidate:IsA("Model") or candidate:IsA("BasePart"))
+			and (candidate:GetAttribute("PhoneJobEnabled") == true
+				or CollectionService:HasTag(candidate, "CleanableJobSite"))
+		then
+			local environment = Workspace:FindFirstChild("EnvironmentFixtures")
+			local runtimeSites = environment and environment:FindFirstChild("JobSites")
+			if runtimeSites and candidate:IsDescendantOf(runtimeSites) then
+				continue
+			end
+			local parentCandidate = candidate.Parent
+			local nested = false
+			while parentCandidate and parentCandidate ~= Workspace do
+				if parentCandidate:GetAttribute("PhoneJobEnabled") == true
+					or CollectionService:HasTag(parentCandidate, "CleanableJobSite")
+				then
+					nested = true
+					break
+				end
+				parentCandidate = parentCandidate.Parent
+			end
+			if not nested then
+				table.insert(candidates, candidate)
+			end
+		end
+	end
+	return candidates
+end
+
+local function connectCandidate(candidate: Instance, jobSites: Folder, config: JobConfig): boolean
+	local site = convertToJobSite(candidate, jobSites, config)
+	local hits, step = scanExposedSurfaces(site, config)
+	if #hits == 0 then
+		warn(string.format("Job authoring: %s produced no exposed dirt locations.", config.JobID))
+		return false
+	end
+	createDirtPatches(site, hits, step, config)
+	print(string.format(
+		"SurfaceJobSetup: connected %s to %s (%s) with %d muddy validation regions.",
+		config.SourceName,
+		config.JobID,
+		config.JobType,
+		#hits
+	))
+	return true
+end
+
 function BenchJobSetup:Init()
 	if initialized then
 		return
@@ -524,6 +641,7 @@ function BenchJobSetup:Init()
 		return
 	end
 
+	local authoredCandidates = collectAuthoredCandidates()
 	for _, config in JOB_CONFIGS do
 		local candidate = findProductionCandidate(config)
 		if candidate == nil then
@@ -535,19 +653,41 @@ function BenchJobSetup:Init()
 			continue
 		end
 
-		local site = convertToJobSite(candidate, jobSites, config)
-		local hits, step = scanExposedSurfaces(site, config)
-		if #hits == 0 then
-			warn(string.format("BenchJobSetup: Workspace.%s produced no exposed dirt locations.", config.SourceName))
+		connectCandidate(candidate, jobSites, config)
+	end
+
+	local seenJobIDs: {[string]: boolean} = {}
+	for _, child in jobSites:GetChildren() do
+		local jobID = child:GetAttribute("JobID")
+		if typeof(jobID) == "string" then seenJobIDs[jobID] = true end
+	end
+	for _, candidate in authoredCandidates do
+		local jobID = candidate:GetAttribute("JobID")
+		local jobType = candidate:GetAttribute("JobType")
+		if typeof(jobID) ~= "string" or jobID == "" or not string.match(jobID, "^[%w_%-]+$") then
+			warn(string.format("Job authoring: %s needs a unique alphanumeric JobID attribute.", candidate:GetFullName()))
 			continue
 		end
-		createDirtPatches(site, hits, step, config)
-		print(string.format(
-			"SurfaceJobSetup: connected Workspace.%s to %s with %d muddy validation regions.",
-			config.SourceName,
-			config.JobID,
-			#hits
-		))
+		if seenJobIDs[jobID] then
+			warn(string.format("Job authoring: duplicate JobID '%s' on %s; skipped.", jobID, candidate:GetFullName()))
+			continue
+		end
+		if typeof(jobType) ~= "string" then
+			warn(string.format("Job authoring: %s needs a JobType attribute.", candidate:GetFullName()))
+			continue
+		end
+		local config = makeAuthoredConfig(candidate, jobID, jobType)
+		if config == nil then
+			warn(string.format(
+				"Job authoring: unsupported JobType '%s' on %s. Use Bench, Fence, Car, Driveway, House, or Mansion.",
+				jobType,
+				candidate:GetFullName()
+			))
+			continue
+		end
+		if connectCandidate(candidate, jobSites, config) then
+			seenJobIDs[jobID] = true
+		end
 	end
 end
 

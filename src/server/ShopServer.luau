@@ -71,6 +71,7 @@ local function sendShopState(player: Player, notice: string?, success: boolean?)
 		EquippedTruck = data.EquippedTruck,
 		Cash = data.Cash,
 		MaxWater = data.MaxWater,
+		Level = data.Level,
 		Notice = notice,
 		Success = success,
 	})
@@ -128,6 +129,10 @@ local function purchaseItem(player: Player, category: string, itemName: string)
 			sendShopState(player, itemName .. " is already owned.", false)
 			return
 		end
+		if data.Level < item.UnlockLevel then
+			sendShopState(player, string.format("Reach level %d to unlock %s.", item.UnlockLevel, itemName), false)
+			return
+		end
 		if item.RequiredWasher and not contains(data.OwnedWashers, item.RequiredWasher) then
 			sendShopState(player, "Buy " .. item.RequiredWasher .. " first.", false)
 			return
@@ -183,7 +188,9 @@ local function purchaseTank(player: Player, tankID: string)
 	end
 
 	data.MaxWater = tier.NewMaxWater
-	data.Water = math.min(data.Water, data.MaxWater)
+	-- A tank upgrade includes a full refill so the benefit is immediately visible
+	-- in the custom water meter and feels rewarding at the computer.
+	data.Water = data.MaxWater
 	DataManager:SyncWater(player)
 	sendShopState(player, "Water tank upgraded!", true)
 end

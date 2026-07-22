@@ -77,6 +77,10 @@ if progressPanelInstance == nil or (not progressPanelInstance:IsA("Frame") and n
 end
 local progressPanel = progressPanelInstance :: GuiObject
 local baseProgressPanelSize = progressPanel.Size
+-- The persistent XP bar occupies the bottom-center edge. Active contract
+-- progress stacks immediately above it instead of obscuring either meter.
+progressPanel.AnchorPoint = Vector2.new(0.5, 1)
+progressPanel.Position = UDim2.new(0.5, 0, 1, -116)
 
 local openPhoneInstance = waitForDescendant(jobFrame, "OpenPhone", 3) or waitForDescendant(jobGui, "OpenPhone", 7)
 if openPhoneInstance == nil or (not openPhoneInstance:IsA("TextButton") and not openPhoneInstance:IsA("ImageButton")) then
@@ -89,6 +93,10 @@ end
 local openPhoneButton = openPhoneInstance :: GuiButton
 
 local SharedJobData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SharedJobData"))
+local SharedUITheme = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SharedUITheme"))
+local UI_COLORS = SharedUITheme.Colors
+local catalogJobs: {[string]: any} = table.clone(SharedJobData.Jobs)
+local catalogJobOrder: {string} = table.clone(SharedJobData.JobOrder)
 local remotes = ReplicatedStorage:WaitForChild("Remotes")
 local AcceptJobRequest = remotes:WaitForChild("AcceptJobRequest") :: RemoteEvent
 local QuitJobRequest = remotes:WaitForChild("QuitJobRequest") :: RemoteEvent
@@ -104,8 +112,10 @@ local currentTargetJobID: string? = nil
 local waypointFolder: Folder? = nil
 local waypointConnection: RBXScriptConnection? = nil
 local unlockedTiers: {[string]: boolean} = { Benches = true }
+local currentLevel = 1
 local jobAvailability: {[string]: boolean} = {}
 local jobButtons: {[string]: GuiButton} = {}
+local connectedJobButtons = setmetatable({} :: {[GuiButton]: boolean}, { __mode = "k" })
 
 -- WasherController uses this non-visual signal for immediate local prediction.
 local progressSignal = playerGui:FindFirstChild("JobProgressPredicted")
@@ -192,7 +202,22 @@ local progressFill = findProgressFill()
 local progressFillFullSize = if progressFill then progressFill.Size else nil
 local LOW_PROGRESS_GREEN = Color3.fromRGB(35, 112, 65)
 local HIGH_PROGRESS_GREEN = Color3.fromRGB(67, 238, 119)
-local JOB_COMPLETION_FRACTION = 0.95
+local DEFAULT_JOB_COMPLETION_FRACTION = 0.95
+local JOB_COMPLETION_FRACTIONS: {[string]: number} = {
+	Driveway_1 = 0.98,
+	SingleStoryHouse_1 = 0.98,
+}
+
+local function getCompletionFraction(jobID: string?): number
+	if jobID then
+		local job = catalogJobs[jobID]
+		if job and typeof(job.CompletionThreshold) == "number" then
+			return math.clamp(job.CompletionThreshold / 100, 0.5, 1)
+		end
+		return JOB_COMPLETION_FRACTIONS[jobID] or DEFAULT_JOB_COMPLETION_FRACTION
+	end
+	return DEFAULT_JOB_COMPLETION_FRACTION
+end
 local targetProgressFraction = 0
 local displayedProgressFraction = 0
 
@@ -202,16 +227,16 @@ end
 
 local function jobIDForButton(button: GuiButton): string?
 	local attribute = button:GetAttribute("JobID")
-	if typeof(attribute) == "string" and SharedJobData.Jobs[attribute] ~= nil then
+	if typeof(attribute) == "string" and catalogJobs[attribute] ~= nil then
 		return attribute
 	end
 
-	if SharedJobData.Jobs[button.Name] ~= nil then
+	if catalogJobs[button.Name] ~= nil then
 		return button.Name
 	end
 
 	local buttonText = if button:IsA("TextButton") then button.Text else ""
-	for _, jobID in ipairs(SharedJobData.JobOrder) do
+	for _, jobID in ipairs(catalogJobOrder) do
 		if string.find(button.Name, jobID, 1, true) or string.find(buttonText, jobID, 1, true) then
 			return jobID
 		end
@@ -220,6 +245,7 @@ local function jobIDForButton(button: GuiButton): string?
 end
 
 local quitButton: GuiButton? = nil
+local closePhoneButton: GuiButton? = nil
 for _, descendant in phoneMenu:GetDescendants() do
 	if descendant:IsA("GuiButton") then
 		local action = descendant:GetAttribute("Action")
@@ -227,7 +253,12 @@ for _, descendant in phoneMenu:GetDescendants() do
 		local lowerText = if descendant:IsA("TextButton") then string.lower(descendant.Text) else ""
 		-- A manually authored button named exactly "Quit" is supported, as is
 		-- any GuiButton carrying the string attribute Action = "QuitJob".
-		if descendant.Name == "Quit"
+		if action == "ClosePhone"
+			or string.find(lowerName, "closephone", 1, true)
+			or lowerName == "x"
+		then
+			closePhoneButton = descendant
+		elseif descendant.Name == "Quit"
 			or action == "QuitJob"
 			or string.find(lowerName, "quit", 1, true)
 			or string.find(lowerText, "quit", 1, true)
@@ -266,16 +297,48 @@ if jobList then
 	end
 end
 
-local function renderJobCards()
-	for _, jobID in SharedJobData.JobOrder do
+local function connectJobButton(jobID: string, button: GuiButton)
+	if connectedJobButtons[button] then return end
+	connectedJobButtons[button] = true
+	button:SetAttribute("JobID", jobID)
+	button.Activated:Connect(function()
+		AcceptJobRequest:FireServer(jobID)
+	end)
+end
+
+local function ensureCatalogJobButtons()
+	if jobList == nil then return end
+	local cardTemplate = jobButtons.Bench_1
+	for order, jobID in catalogJobOrder do
 		local button = jobButtons[jobID]
-		local job = SharedJobData.Jobs[jobID]
+		if button == nil then
+			local existing = jobList:FindFirstChild(jobID)
+			if existing and existing:IsA("GuiButton") then
+				button = existing
+			elseif cardTemplate then
+				button = cardTemplate:Clone()
+				button.Name = jobID
+				button.Parent = jobList
+			end
+			if button then jobButtons[jobID] = button end
+		end
+		if button then
+			button.LayoutOrder = order
+			connectJobButton(jobID, button)
+		end
+	end
+end
+
+local function renderJobCards()
+	for _, jobID in catalogJobOrder do
+		local button = jobButtons[jobID]
+		local job = catalogJobs[jobID]
 		if button and job then
 			local unlocked = unlockedTiers[job.RequiredTier] == true
 			local available = jobAvailability[jobID] == true
 			local isActive = activeJobID == jobID
 			local status: string
-			if not unlocked then status = "LOCKED  •  Complete previous tier"
+			if not unlocked then status = string.format("LOCKED  •  LEVEL %d REQUIRED (YOU: %d)", job.UnlockLevel or 1, currentLevel)
 			elseif not available then status = "SITE COMING SOON"
 			elseif isActive then status = "ACTIVE JOB"
 			elseif activeJobID ~= nil then status = "FINISH CURRENT JOB FIRST"
@@ -292,14 +355,21 @@ local function renderJobCards()
 				button.Font = Enum.Font.GothamBold
 			end
 			local legacyGradient = button:FindFirstChildWhichIsA("UIGradient")
-			if legacyGradient then legacyGradient.Enabled = false end
+			if legacyGradient then
+				legacyGradient.Enabled = false
+			end
 			button.Size = UDim2.new(1, -4, 0, 76)
 			button.Active = unlocked and available and activeJobID == nil
 			button.AutoButtonColor = button.Active
 			button.BackgroundColor3 = if isActive
-				then Color3.fromRGB(43, 142, 92)
-				elseif not unlocked or not available then Color3.fromRGB(63, 70, 82)
-				else Color3.fromRGB(41, 126, 181)
+				then UI_COLORS.Green:Lerp(UI_COLORS.Surface, 0.58)
+				elseif not unlocked or not available then UI_COLORS.MutedSurface
+				else UI_COLORS.Surface
+			local cardStroke = button:FindFirstChildWhichIsA("UIStroke")
+			if cardStroke then
+				cardStroke.Color = if isActive then UI_COLORS.Green else UI_COLORS.Cyan
+				cardStroke.Transparency = if unlocked and available then 0.28 else 0.7
+			end
 		end
 	end
 	for _, comboID in SharedJobData.ComboJobOrder do
@@ -326,14 +396,16 @@ local function renderJobCards()
 				button.Font = Enum.Font.GothamBold
 			end
 			local gradient = button:FindFirstChildWhichIsA("UIGradient")
-			if gradient then gradient.Enabled = false end
+			if gradient then
+				gradient.Enabled = false
+			end
 			button.Size = UDim2.new(1, -4, 0, 82)
 			button.Active = unlocked and available and activeJobID == nil
 			button.AutoButtonColor = button.Active
 			button.BackgroundColor3 = if isActive
-				then Color3.fromRGB(48, 150, 101)
-				elseif not unlocked or not available then Color3.fromRGB(70, 65, 79)
-				else Color3.fromRGB(116, 72, 164)
+				then UI_COLORS.Green:Lerp(UI_COLORS.Surface, 0.58)
+				elseif not unlocked or not available then UI_COLORS.MutedSurface
+				else UI_COLORS.Purple:Lerp(UI_COLORS.Surface, 0.68)
 		end
 	end
 end
@@ -425,14 +497,34 @@ local function showQuitConfirmation()
 	confirm.Activated:Connect(function() popup:Destroy(); QuitJobRequest:FireServer() end)
 end
 
-for jobID, button in jobButtons do
-	button.Activated:Connect(function() AcceptJobRequest:FireServer(jobID) end)
-end
+for jobID, button in jobButtons do connectJobButton(jobID, button) end
 for comboID, button in comboButtons do
 	button.Activated:Connect(function() AcceptJobRequest:FireServer(comboID) end)
 end
 if quitButton then quitButton.Activated:Connect(showQuitConfirmation) end
+if closePhoneButton then
+	closePhoneButton.Activated:Connect(function()
+		phoneMenu.Visible = false
+	end)
+end
+ensureCatalogJobButtons()
 renderJobCards()
+
+SharedUITheme.StylePanel(phoneMenu, UI_COLORS.Cyan)
+local phoneOutline = phoneMenu:FindFirstChildWhichIsA("UIStroke")
+if phoneOutline then
+	phoneOutline.Enabled = false
+end
+SharedUITheme.StyleLauncher(openPhoneButton, UI_COLORS.Cyan, "PHONE   >")
+SharedUITheme.BindButtonMotion(openPhoneButton, UI_COLORS.Cyan)
+if closePhoneButton then
+	if closePhoneButton:IsA("TextButton") then
+		closePhoneButton.TextColor3 = UI_COLORS.Text
+	end
+	local closeGradient = closePhoneButton:FindFirstChildWhichIsA("UIGradient")
+	if closeGradient then closeGradient.Enabled = false end
+	SharedUITheme.BindButtonMotion(closePhoneButton, UI_COLORS.Cyan)
+end
 
 local function updateProgress()
 	if activeJobID == nil or totalSegments <= 0 then
@@ -681,7 +773,11 @@ RunService.RenderStepped:Connect(function(deltaTime)
 		if math.abs(targetProgressFraction - displayedProgressFraction) < 0.0005 then
 			displayedProgressFraction = targetProgressFraction
 		end
-		local brightnessProgress = math.clamp(displayedProgressFraction / JOB_COMPLETION_FRACTION, 0, 1)
+		local brightnessProgress = math.clamp(
+			displayedProgressFraction / getCompletionFraction(currentTargetJobID or activeJobID),
+			0,
+			1
+		)
 		local targetSize = UDim2.new(
 			progressFillFullSize.X.Scale * displayedProgressFraction,
 			math.round(progressFillFullSize.X.Offset * displayedProgressFraction),
@@ -787,8 +883,8 @@ predictedProgressEvent.Event:Connect(function(segment)
 		end
 	end
 	-- Prediction stays responsive but cannot announce completion. Only a
-	-- server-confirmed Progress/Completed state may reach the 95% finish line.
-	local predictedCeiling = totalSegments * (JOB_COMPLETION_FRACTION - 0.001)
+	-- Server-confirmed Progress/Completed state owns the final threshold.
+	local predictedCeiling = totalSegments * (getCompletionFraction(currentTargetJobID or activeJobID) - 0.001)
 	currentCleaned = math.min(predictedCeiling, currentCleaned + weight)
 	updateProgress()
 end)
@@ -799,12 +895,25 @@ JobStateChanged.OnClientEvent:Connect(function(state)
 	end
 
 	if state.State == "Catalog" then
+		if typeof(state.JobDefinitions) == "table" then
+			catalogJobs = state.JobDefinitions
+		end
+		if typeof(state.JobOrder) == "table" then
+			catalogJobOrder = {}
+			for _, jobID in state.JobOrder do
+				if typeof(jobID) == "string" and catalogJobs[jobID] ~= nil then
+					table.insert(catalogJobOrder, jobID)
+				end
+			end
+		end
 		unlockedTiers = {}
 		for _, tier in state.UnlockedJobTiers or {} do
 			if typeof(tier) == "string" then unlockedTiers[tier] = true end
 		end
 		jobAvailability = if typeof(state.Availability) == "table" then state.Availability else {}
+		currentLevel = if typeof(state.Level) == "number" then state.Level else currentLevel
 		if typeof(state.ActiveJobID) == "string" then activeJobID = state.ActiveJobID end
+		ensureCatalogJobButtons()
 		renderJobCards()
 	elseif state.State == "Rejected" then
 		showJobNotice(if typeof(state.Message) == "string" then state.Message else "Job request rejected.", false)

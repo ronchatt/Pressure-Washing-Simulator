@@ -12,7 +12,6 @@ local DataManager = require(script.Parent:WaitForChild("DataManager"))
 local JobManager = require(script.Parent:WaitForChild("JobManager"))
 local MonetizationManager = require(script.Parent:WaitForChild("MonetizationManager"))
 local shared = ReplicatedStorage:WaitForChild("Shared")
-local SharedJobData = require(shared:WaitForChild("SharedJobData"))
 local SharedWaterData = require(shared:WaitForChild("SharedWaterData"))
 
 local remotes = ReplicatedStorage:WaitForChild("Remotes")
@@ -47,11 +46,42 @@ local function getBaseWaterPart(): BasePart?
 	return findInteractionPart(fallbackBase and fallbackBase:FindFirstChild("WaterStation"))
 end
 
+local function getHydrantParts(): {BasePart}
+	local hydrants: {BasePart} = {}
+	local seen: {[BasePart]: boolean} = {}
+	for _, candidate in Workspace:GetDescendants() do
+		local marked = candidate:GetAttribute("HydrantWaterSource") == true
+		local legacy = candidate.Name == "Fire Hydrant" and candidate.Parent == Workspace
+		if marked or legacy then
+			local part = findInteractionPart(candidate)
+			if part and not seen[part] then
+				seen[part] = true
+				table.insert(hydrants, part)
+			end
+		end
+	end
+	return hydrants
+end
+
+local function getNearestHydrant(player: Player): BasePart?
+	local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	local best: BasePart? = nil
+	local bestDistance = math.huge
+	for _, hydrant in getHydrantParts() do
+		local distance = if root and root:IsA("BasePart") then (root.Position - hydrant.Position).Magnitude else 0
+		if distance < bestDistance then
+			best = hydrant
+			bestDistance = distance
+		end
+	end
+	return best
+end
+
 local function getSource(refillType: string, player: Player): (BasePart?, string?)
 	if refillType == "Base" then
 		return getBaseWaterPart(), nil
 	elseif refillType == "Hydrant" then
-		return findInteractionPart(Workspace:FindFirstChild("Fire Hydrant", true)), nil
+		return getNearestHydrant(player), nil
 	elseif refillType == "Customer" then
 		local activeJob = JobManager:GetActiveJob(player)
 		if activeJob == nil then return nil, "Accept a job before using customer water." end
@@ -89,12 +119,16 @@ local function setupPrompts()
 	else
 		warn("WaterEconomyManager could not find Workspace.Base['Water refill']")
 	end
-	local hydrant = findInteractionPart(Workspace:FindFirstChild("Fire Hydrant", true))
-	if hydrant then createPrompt(hydrant, "HydrantRefillPrompt", "Hydrant", "City Fire Hydrant") end
-	for jobID in SharedJobData.Jobs do
-		local sitePart = findInteractionPart(getJobSite(jobID))
+	for _, hydrant in getHydrantParts() do
+		createPrompt(hydrant, "HydrantRefillPrompt", "Hydrant", "City Fire Hydrant")
+	end
+	local environment = Workspace:FindFirstChild("EnvironmentFixtures")
+	local runtimeSites = environment and environment:FindFirstChild("JobSites")
+	for _, site in if runtimeSites then runtimeSites:GetChildren() else {} do
+		local jobID = site:GetAttribute("JobID")
+		local sitePart = findInteractionPart(site)
 		if sitePart then
-			createPrompt(sitePart, "CustomerWaterPrompt", "Customer", jobID, jobID)
+			createPrompt(sitePart, "CustomerWaterPrompt", "Customer", tostring(jobID or site.Name), if typeof(jobID) == "string" then jobID else nil)
 		end
 	end
 end

@@ -3,9 +3,12 @@
 -- Display and validation metadata. The server validates ownership, cash, and
 -- tier order before it writes any of these upgrades into a player profile.
 
+local SharedProgressionData = require(script.Parent:WaitForChild("SharedProgressionData"))
+
 export type Washer = {
 	Name: string,
 	Tier: number,
+	UnlockLevel: number,
 	Cost: number,
 	CleanSpeed: number,
 	SprayWidth: number,
@@ -18,57 +21,24 @@ export type Washer = {
 export type Truck = { Name: string, Cost: number }
 export type TankTier = { Name: string, Cost: number, RequiredMaxWater: number, NewMaxWater: number }
 
+-- Dense, continuous driveway grime needs a much steeper progression curve
+-- than small prop dirt. These values are total power relative to the starter:
+-- Basic 1x, Heavy 4x, Professional 8x, Industrial 14x. Piecewise interpolation
+-- also keeps future in-between washer tiers predictable.
+local function getDrivewayPowerScale(cleanSpeed: number): number
+	local rawScale = math.max(1, cleanSpeed / 0.5)
+	if rawScale <= 1.5 then
+		return 1 + (rawScale - 1) / 0.5 * 3
+	elseif rawScale <= 2.3 then
+		return 4 + (rawScale - 1.5) / 0.8 * 4
+	end
+	return 8 + math.clamp((rawScale - 2.3) / 1.7, 0, 1) * 6
+end
+
 local SharedShopData = {
-	Washers = {
-		["Basic Backpack"] = {
-			Name = "Basic Backpack",
-			Tier = 1,
-			Cost = 0,
-			CleanSpeed = 0.5,
-			SprayWidth = 1,
-			WaterEfficiency = 1,
-			EffectiveRange = 1,
-			AccentColor = Color3.fromRGB(45, 128, 190),
-			Description = "Reliable starter washer",
-		},
-		["Heavy Duty Washer"] = {
-			Name = "Heavy Duty Washer",
-			Tier = 2,
-			Cost = 500,
-			CleanSpeed = 0.75,
-			SprayWidth = 1.2,
-			WaterEfficiency = 1.15,
-			EffectiveRange = 1.15,
-			AccentColor = Color3.fromRGB(235, 151, 49),
-			Description = "Wider and more efficient",
-			RequiredWasher = "Basic Backpack",
-		},
-		["Professional Washer"] = {
-			Name = "Professional Washer",
-			Tier = 3,
-			Cost = 2_000,
-			CleanSpeed = 1.15,
-			SprayWidth = 1.5,
-			WaterEfficiency = 1.35,
-			EffectiveRange = 1.3,
-			AccentColor = Color3.fromRGB(59, 201, 122),
-			Description = "Professional cleaning coverage",
-			RequiredWasher = "Heavy Duty Washer",
-		},
-		["Industrial Washer"] = {
-			Name = "Industrial Washer",
-			Tier = 4,
-			Cost = 7_500,
-			CleanSpeed = 2,
-			SprayWidth = 1.9,
-			WaterEfficiency = 1.7,
-			EffectiveRange = 1.5,
-			AccentColor = Color3.fromRGB(172, 91, 235),
-			Description = "Maximum commercial pressure",
-			RequiredWasher = "Professional Washer",
-		},
-	} :: {[string]: Washer},
-	WasherOrder = { "Basic Backpack", "Heavy Duty Washer", "Professional Washer", "Industrial Washer" },
+	GetDrivewayPowerScale = getDrivewayPowerScale,
+	Washers = SharedProgressionData.Washers :: {[string]: Washer},
+	WasherOrder = SharedProgressionData.WasherOrder,
 	Trucks = {
 		["Basic Pickup"] = { Name = "Basic Pickup", Cost = 0 },
 		["Flatbed Truck"] = { Name = "Flatbed Truck", Cost = 1000 },

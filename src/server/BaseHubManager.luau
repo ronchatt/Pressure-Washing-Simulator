@@ -77,16 +77,24 @@ local function ensureStation(base: Instance, building: BasePart)
 		0.3,
 		building.Position.Z
 	)
+	local existingPlatform = station:FindFirstChild("Platform")
+	local platformWasCreated = existingPlatform == nil or not existingPlatform:IsA("Part")
 	local platform = ensurePart(station, "Platform")
-	platform.Size = Vector3.new(5.5, 0.6, 4.2)
-	platform.CFrame = CFrame.lookAt(platformPosition, Vector3.new(center.X, platformPosition.Y, center.Z))
+	if platformWasCreated then
+		platform.Size = Vector3.new(5.5, 0.6, 4.2)
+		platform.CFrame = CFrame.lookAt(platformPosition, Vector3.new(center.X, platformPosition.Y, center.Z))
+	end
 	platform.Anchored = true
 	platform.CanCollide = true
 	platform.Material = Enum.Material.Metal
 	platform.Color = Color3.fromRGB(28, 49, 65)
+	local existingTerminal = station:FindFirstChild("SpawnTerminal")
+	local terminalWasCreated = existingTerminal == nil or not existingTerminal:IsA("Part")
 	local terminal = ensurePart(station, "SpawnTerminal")
-	terminal.Size = Vector3.new(1.7, 3.1, 1.25)
-	terminal.CFrame = platform.CFrame * CFrame.new(0, 1.85, 0.85)
+	if terminalWasCreated then
+		terminal.Size = Vector3.new(1.7, 3.1, 1.25)
+		terminal.CFrame = platform.CFrame * CFrame.new(0, 1.85, 0.85)
+	end
 	terminal.Anchored = true
 	terminal.CanCollide = true
 	terminal.Material = Enum.Material.Metal
@@ -112,6 +120,9 @@ local function ensureStation(base: Instance, building: BasePart)
 	sign.Name = "StationSign"
 	sign.Size = UDim2.fromOffset(210, 54)
 	sign.StudsOffset = Vector3.new(0, 2.6, 0)
+	-- A fixed-pixel BillboardGui appears enormous when viewed from far away.
+	-- Hide this local interaction label outside the station's useful range.
+	sign.MaxDistance = 18
 	sign.AlwaysOnTop = false
 	sign.Parent = terminal
 	local text = Instance.new("TextLabel")

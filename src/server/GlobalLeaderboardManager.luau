@@ -66,15 +66,18 @@ local function ensureBoard()
 	end
 	local board = model:FindFirstChild("Board")
 	if board ~= nil and not board:IsA("Part") then board:Destroy(); board = nil end
+	local boardWasCreated = board == nil
 	if board == nil then
 		board = Instance.new("Part")
 		board.Name = "Board"
 		board.Parent = model
 	end
 	local typedBoard = board :: Part
-	typedBoard.Size = Vector3.new(11, 7.5, 0.4)
-	local position = computer.Position + Vector3.new(-8.5, 4.6, 0)
-	typedBoard.CFrame = CFrame.lookAt(position, Vector3.new(-16, position.Y, 164))
+	if boardWasCreated then
+		typedBoard.Size = Vector3.new(11, 7.5, 0.4)
+		local position = computer.Position + Vector3.new(-8.5, 4.6, 0)
+		typedBoard.CFrame = CFrame.lookAt(position, Vector3.new(-16, position.Y, 164))
+	end
 	typedBoard.Anchored = true
 	typedBoard.CanCollide = false
 	typedBoard.Material = Enum.Material.SmoothPlastic

@@ -5,26 +5,10 @@
 -- received the corresponding instances from a Rojo project sync.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local BLOCKED_SOUND_ASSET_ID = "188608071"
-
-local function disableBlockedSound(instance: Instance)
-	if not instance:IsA("Sound") or not string.find(instance.SoundId, BLOCKED_SOUND_ASSET_ID, 1, true) then
-		return
-	end
-	local fullName = instance:GetFullName()
-	local success, message = pcall(function()
-		instance:Stop()
-		instance.SoundId = ""
-	end)
-	if success then
-		warn("DIAGNOSTIC: Cleared blocked sound from " .. fullName)
-	else
-		warn(string.format("DIAGNOSTIC: Could not clear blocked sound from %s: %s", fullName, tostring(message)))
-	end
-end
 
 local REMOTE_EVENT_NAMES = {
 	"CleanSegmentRequest",
+	"CleanSegmentResult",
 	"SprayWaterRequest",
 	"AcceptJobRequest",
 	"QuitJobRequest",
@@ -90,11 +74,6 @@ function ReplicatedStorageBootstrapper:Init()
 	end
 	initialized = true
 
-	for _, descendant in game:GetDescendants() do
-		disableBlockedSound(descendant)
-	end
-	game.DescendantAdded:Connect(disableBlockedSound)
-
 	local remotes = ensureFolder(ReplicatedStorage, "Remotes")
 	for _, remoteName in REMOTE_EVENT_NAMES do
 		ensureRemoteEvent(remotes, remoteName)
@@ -102,6 +81,7 @@ function ReplicatedStorageBootstrapper:Init()
 
 	ensureFolder(ReplicatedStorage, "Washers")
 	ensureFolder(ReplicatedStorage, "Vehicles")
+	ensureFolder(ReplicatedStorage, "Pets")
 end
 
 return ReplicatedStorageBootstrapper

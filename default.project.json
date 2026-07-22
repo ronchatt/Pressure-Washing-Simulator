@@ -10,6 +10,9 @@
       "Vehicles": {
         "$className": "Folder"
       },
+      "Pets": {
+        "$className": "Folder"
+      },
       "Shared": {
         "$path": "src/shared"
       },
@@ -17,6 +20,9 @@
       "Remotes": {
         "$className": "Folder",
         "CleanSegmentRequest": {
+          "$className": "RemoteEvent"
+        },
+        "CleanSegmentResult": {
           "$className": "RemoteEvent"
         },
         "SprayWaterRequest": {

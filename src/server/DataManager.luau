@@ -8,10 +8,21 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local shared = ReplicatedStorage:WaitForChild("Shared")
 local packages = shared:WaitForChild("Packages")
 local ProfileService = require(packages:WaitForChild("ProfileService"))
+local SharedProgressionData = require(shared:WaitForChild("SharedProgressionData"))
+
+export type OwnedPetData = {
+	UID: string,
+	PetID: string,
+}
 
 export type PlayerData = {
 	Cash: number,
 	LifetimeCashEarned: number,
+	XP: number,
+	Level: number,
+	Rebirths: number,
+	TotalJobsCompleted: number,
+	JobCompletions: {[string]: number},
 	Water: number,
 	MaxWater: number,
 	EquippedWasher: string,
@@ -19,7 +30,7 @@ export type PlayerData = {
 	OwnedWashers: {string},
 	OwnedTrucks: {string},
 	UnlockedJobTiers: {string},
-	OwnedPets: {string},
+	OwnedPets: {OwnedPetData},
 	EquippedPet: string?,
 	TutorialCompleted: boolean,
 	DevelopmentGrants: {
@@ -34,6 +45,11 @@ export type PlayerData = {
 local PROFILE_TEMPLATE: PlayerData = {
 	Cash = 0,
 	LifetimeCashEarned = 0,
+	XP = 0,
+	Level = 1,
+	Rebirths = 0,
+	TotalJobsCompleted = 0,
+	JobCompletions = {},
 	-- Water is the current fill level; MaxWater is the backpack's capacity.
 	Water = 100,
 	MaxWater = 100,
@@ -98,6 +114,42 @@ local function syncWaterAttributes(player: Player, data: PlayerData)
 	player:SetAttribute("MaxWater", data.MaxWater)
 end
 
+local function syncSettingsAttributes(player: Player, data: PlayerData)
+	if player.Parent == nil then return end
+	player:SetAttribute("MusicVolume", math.clamp(data.Settings.MusicVolume, 0, 1))
+	player:SetAttribute("SFXVolume", math.clamp(data.Settings.SFXVolume, 0, 1))
+end
+
+local function syncProgressionAttributes(player: Player, data: PlayerData)
+	if player.Parent == nil then return end
+	player:SetAttribute("XP", data.XP)
+	player:SetAttribute("Level", data.Level)
+	player:SetAttribute("XPToNextLevel", SharedProgressionData.GetXPToNextLevel(data.XP))
+	player:SetAttribute("Rebirths", data.Rebirths)
+	player:SetAttribute("TotalJobsCompleted", data.TotalJobsCompleted)
+end
+
+local function migrateProgressionData(data: PlayerData)
+	-- Returning development profiles may already have later tiers unlocked. Lift
+	-- their level to the matching milestone instead of taking access away.
+	local minimumLevel = math.max(1, data.Level)
+	for _, tierName in data.UnlockedJobTiers do
+		for _, jobID in SharedProgressionData.JobOrder do
+			local progression = SharedProgressionData.Jobs[jobID]
+			if progression.TierName == tierName then
+				minimumLevel = math.max(minimumLevel, progression.UnlockLevel)
+			end
+		end
+	end
+	data.XP = math.max(0, data.XP, SharedProgressionData.GetXPForLevel(minimumLevel))
+	data.Level = SharedProgressionData.GetLevelFromXP(data.XP)
+	for _, tierName in SharedProgressionData.GetUnlockedTiers(data.Level) do
+		if not table.find(data.UnlockedJobTiers, tierName) then
+			table.insert(data.UnlockedJobTiers, tierName)
+		end
+	end
+end
+
 function DataManager:GetProfile(player: Player)
 	return profiles[player]
 end
@@ -144,7 +196,10 @@ function DataManager:LoadProfile(player: Player)
 	end
 
 	profiles[player] = profile
+	migrateProgressionData(profile.Data)
 	syncWaterAttributes(player, profile.Data)
+	syncSettingsAttributes(player, profile.Data)
+	syncProgressionAttributes(player, profile.Data)
 	return profile
 end
 
@@ -264,6 +319,45 @@ function DataManager:UnlockJobTier(player: Player, tierName: string): boolean
 
 	table.insert(data.UnlockedJobTiers, tierName)
 	return true
+end
+
+function DataManager:RecordJobCompletion(player: Player, jobID: string, xpReward: number)
+	if jobID == "" or not isValidAmount(xpReward) or xpReward < 0 then return nil end
+	local data = self:GetData(player)
+	if data == nil then return nil end
+
+	local previousLevel = data.Level
+	data.TotalJobsCompleted += 1
+	data.JobCompletions[jobID] = (data.JobCompletions[jobID] or 0) + 1
+	data.XP += math.floor(xpReward)
+	data.Level = SharedProgressionData.GetLevelFromXP(data.XP)
+	local newlyUnlockedTiers = {}
+	for _, tierName in SharedProgressionData.GetUnlockedTiers(data.Level) do
+		if not table.find(data.UnlockedJobTiers, tierName) then
+			table.insert(data.UnlockedJobTiers, tierName)
+			table.insert(newlyUnlockedTiers, tierName)
+		end
+	end
+	syncProgressionAttributes(player, data)
+	return {
+		XPReward = math.floor(xpReward),
+		XP = data.XP,
+		Level = data.Level,
+		PreviousLevel = previousLevel,
+		LeveledUp = data.Level > previousLevel,
+		XPToNextLevel = SharedProgressionData.GetXPToNextLevel(data.XP),
+		TotalJobsCompleted = data.TotalJobsCompleted,
+		NewlyUnlockedTiers = newlyUnlockedTiers,
+	}
+end
+
+function DataManager:CanRebirth(player: Player): boolean
+	local data = self:GetData(player)
+	if data == nil then return false end
+	local rebirth = SharedProgressionData.Rebirth
+	return data.Level >= rebirth.RequiredLevel
+		and (data.JobCompletions[rebirth.RequiredJobID] or 0) > 0
+		and data.Rebirths < rebirth.MaximumRebirths
 end
 
 function DataManager:IsTutorialCompleted(player: Player): boolean

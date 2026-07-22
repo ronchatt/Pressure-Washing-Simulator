@@ -12,11 +12,23 @@ local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
+local SharedShopData = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SharedShopData"))
+local AudioManager = require(script.Parent:WaitForChild("AudioManager"))
+
 local PLAYER = Players.LocalPlayer
 local PLAYER_MOUSE = PLAYER:GetMouse()
 local DIRT_TAG = "DirtSegment"
 local DEFAULT_CLEAN_SPEED = 0.5
-local MAX_SPRAY_DISTANCE = 90
+local SPRAY_JET_SOUND_ID = "rbxassetid://9120591873"
+local SPRAY_BODY_SOUND_ID = "rbxassetid://9120610020"
+local SPRAY_JET_VOLUME = 0.52
+local SPRAY_BODY_VOLUME = 0.2
+local SPRAY_SOUND_FADE_IN = 0.08
+local SPRAY_SOUND_FADE_OUT = 0.12
+local MAX_VISUAL_SPRAY_DISTANCE = 55
+local MAX_EFFECTIVE_CLEAN_DISTANCE = 34
+local MAX_UPWARD_HOUSE_REACH = 7
+local NOZZLE_SURFACE_OVERSHOOT = 2
 local WATER_REPORT_INTERVAL = 0.25
 local CLEAN_REPORT_INTERVAL = 0.1
 local CLEAN_TWEEN_STEP = 0.1
@@ -27,13 +39,8 @@ local PIXEL_BRUSH_RADIUS = 3
 local DIRT_IMAGE_SIZE = Vector2.new(512, 768)
 local DIRT_BRUSH_RADIUS = 28
 local BASE_WORLD_BRUSH_RADIUS = 0.55
-local FULL_PRESSURE_DISTANCE = 12
-local PRESSURE_FALLOFF_DISTANCE = 70
-local MIN_PRESSURE_MULTIPLIER = 0.2
-local DISTANCE_RESISTANCE_EXPONENT = 1.35
-local HOUSE_JOB_ID = "SingleStoryHouse_1"
-local DRIVEWAY_JOB_ID = "Driveway_1"
-local CAR_JOB_ID = "Car_1"
+local FULL_PRESSURE_DISTANCE = 10
+local DISTANCE_RESISTANCE_EXPONENT = 1.5
 local HOUSE_PIXELS_PER_STUD = 24
 -- Large buildings contain far more validation regions than props. These
 -- moderate boosts keep the starter washer brisk on house grime without
@@ -42,8 +49,13 @@ local HOUSE_BRUSH_RADIUS_MULTIPLIER = 2.35
 local HOUSE_CLEAN_POWER_MULTIPLIER = 2.1
 local HOUSE_VISUAL_FADE_MULTIPLIER = 3.1
 local HOUSE_SPRAY_VISUAL_MULTIPLIER = 1.65
-local CAR_BRUSH_RADIUS_MULTIPLIER = 1.55
-local DRIVEWAY_BRUSH_RADIUS_MULTIPLIER = 2.5
+local CAR_BRUSH_RADIUS_MULTIPLIER = 1.1
+-- Driveways still reward broad sweeping passes, but this tighter footprint
+-- prevents high-tier washers from erasing several feet of grime at once.
+local DRIVEWAY_BRUSH_RADIUS_MULTIPLIER = 1.65
+local DRIVEWAY_FADE_TILES_SIZE = 24
+local DRIVEWAY_MIN_DISPLAY_FADE_PER_SECOND = 650
+local DRIVEWAY_MAX_DISPLAY_FADE_PER_SECOND = 1450
 
 type LiquidDirtCanvas = {
 	Part: Part,
@@ -66,6 +78,9 @@ type DrivewayDirtCanvas = {
 	Source: BasePart,
 	Image: EditableImage,
 	Pixels: buffer,
+	TargetAlpha: buffer,
+	DirtyTiles: {[number]: boolean},
+	TileColumns: number,
 	Width: number,
 	Height: number,
 }
@@ -92,12 +107,15 @@ assert(washersInstance:IsA("Folder"), "ReplicatedStorage.Washers must be a Folde
 local Washers = washersInstance :: Folder
 local remotes = ReplicatedStorage:WaitForChild("Remotes")
 local cleanRequestInstance = remotes:WaitForChild("CleanSegmentRequest")
+local cleanResultInstance = remotes:WaitForChild("CleanSegmentResult")
 local sprayRequestInstance = remotes:WaitForChild("SprayWaterRequest")
 local jobStateInstance = remotes:WaitForChild("JobStateChanged")
 assert(cleanRequestInstance:IsA("RemoteEvent"), "CleanSegmentRequest must be a RemoteEvent")
+assert(cleanResultInstance:IsA("RemoteEvent"), "CleanSegmentResult must be a RemoteEvent")
 assert(sprayRequestInstance:IsA("RemoteEvent"), "SprayWaterRequest must be a RemoteEvent")
 assert(jobStateInstance:IsA("RemoteEvent"), "JobStateChanged must be a RemoteEvent")
 local CleanSegmentRequest = cleanRequestInstance :: RemoteEvent
+local CleanSegmentResult = cleanResultInstance :: RemoteEvent
 local SprayWaterRequest = sprayRequestInstance :: RemoteEvent
 local JobStateChanged = jobStateInstance :: RemoteEvent
 local playerGui = PLAYER:WaitForChild("PlayerGui")
@@ -110,6 +128,9 @@ end
 local typedSprayStateSignal = sprayStateSignal :: BindableEvent
 local activeTool: Tool? = nil
 local sprayEmitter: ParticleEmitter? = nil
+local sprayLoopSounds: {Sound} = {}
+local spraySoundTweens: {Tween} = {}
+local spraySoundGeneration = 0
 local waterBeam: Beam? = nil
 local waterEndpoint: Part? = nil
 local impactEmitter: ParticleEmitter? = nil
@@ -128,6 +149,7 @@ local dirtImage: EditableImage? = nil
 local dirtDriveway: BasePart? = nil
 local dirtPixelBuffer: buffer? = nil
 local previousDirtImagePoint: Vector2? = nil
+local previousDrivewayImagePoint: Vector2? = nil
 local activeJobID: string? = nil
 local activeIncludedJobIDs: {string} = {}
 local activeIncludedLookup: {[string]: boolean} = {}
@@ -135,11 +157,68 @@ local currentSprayJobID: string? = nil
 local pendingCleanSegments: {Instance} = {}
 local pendingCleanLookup: {[Instance]: boolean} = {}
 local cleanReportAccumulator = 0
-local houseDirtCanvases: {LiquidDirtCanvas} = {}
-local rebuildHouseLiquidDirt: (() -> ())? = nil
+local surfaceDirtCanvases: {[string]: {LiquidDirtCanvas}} = {}
 local drivewayDirtCanvas: DrivewayDirtCanvas? = nil
-local rebuildDrivewayLiquidDirt: (() -> ())? = nil
+local drivewayDirtJobID: string? = nil
+local rebuildLiquidDirtForJob: ((string) -> ())? = nil
+local clearLiquidDirtForJob: ((string) -> ())? = nil
 local drivewayDirtSpatialCache = setmetatable({} :: {[Instance]: DirtSpatialIndex}, { __mode = "k" })
+local aimCursorDot: Frame? = nil
+local aimCursorEnabled = false
+local previousMouseIconEnabled = true
+
+local function ensureAimCursor(): Frame
+	if aimCursorDot ~= nil and aimCursorDot.Parent ~= nil then return aimCursorDot end
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "WasherAimCursor"
+	gui.DisplayOrder = 1000
+	gui.IgnoreGuiInset = true
+	gui.ResetOnSpawn = false
+	gui.Parent = playerGui
+
+	local dot = Instance.new("Frame")
+	dot.Name = "AimDot"
+	dot.AnchorPoint = Vector2.new(0.5, 0.5)
+	dot.Size = UDim2.fromOffset(8, 8)
+	dot.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	dot.BorderSizePixel = 0
+	dot.Visible = false
+	dot.ZIndex = 10
+	dot.Parent = gui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(1, 0)
+	corner.Parent = dot
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(20, 27, 34)
+	stroke.Thickness = 1.5
+	stroke.Transparency = 0.18
+	stroke.Parent = dot
+
+	aimCursorDot = dot
+	return dot
+end
+
+local function setAimCursorEnabled(enabled: boolean)
+	enabled = enabled and UserInputService.MouseEnabled
+	if enabled == aimCursorEnabled then return end
+	aimCursorEnabled = enabled
+	local dot = ensureAimCursor()
+	if enabled then
+		previousMouseIconEnabled = UserInputService.MouseIconEnabled
+		UserInputService.MouseIconEnabled = false
+		dot.Visible = true
+	else
+		dot.Visible = false
+		UserInputService.MouseIconEnabled = previousMouseIconEnabled
+	end
+end
+
+local function updateAimCursor()
+	if not aimCursorEnabled or aimCursorDot == nil then return end
+	local mousePosition = UserInputService:GetMouseLocation()
+	aimCursorDot.Position = UDim2.fromOffset(mousePosition.X, mousePosition.Y)
+end
 
 local function fillDirtBuffer(pixels: buffer)
 	local imageWidth = DIRT_IMAGE_SIZE.X
@@ -259,7 +338,20 @@ local function initializeHighResolutionDirt()
 	print("DIAGNOSTIC: High-resolution 512x768 dirt mask is active.")
 end
 
-local function resetJobDirt(jobID: string)
+local function getJobSite(jobID: string): Instance?
+	local environment = Workspace:FindFirstChild("EnvironmentFixtures")
+	local jobSites = environment and environment:FindFirstChild("JobSites")
+	return jobSites and jobSites:FindFirstChild(jobID)
+end
+
+local function getJobType(jobID: string?): string?
+	if jobID == nil then return nil end
+	local site = getJobSite(jobID)
+	local jobType = site and site:GetAttribute("JobType")
+	return if typeof(jobType) == "string" then jobType else nil
+end
+
+local function resetJobDirt(jobID: string, rebuildVisuals: boolean?)
 	local environment = Workspace:FindFirstChild("EnvironmentFixtures")
 	local jobSites = environment and environment:FindFirstChild("JobSites")
 	local site = jobSites and jobSites:FindFirstChild(jobID)
@@ -295,11 +387,8 @@ local function resetJobDirt(jobID: string)
 		fillDirtBuffer(dirtPixelBuffer)
 		dirtImage:WritePixelsBuffer(Vector2.zero, DIRT_IMAGE_SIZE, dirtPixelBuffer)
 	end
-	if jobID == HOUSE_JOB_ID and rebuildHouseLiquidDirt ~= nil then
-		rebuildHouseLiquidDirt()
-	end
-	if jobID == DRIVEWAY_JOB_ID and rebuildDrivewayLiquidDirt ~= nil then
-		rebuildDrivewayLiquidDirt()
+	if rebuildVisuals ~= false and rebuildLiquidDirtForJob ~= nil then
+		rebuildLiquidDirtForJob(jobID)
 	end
 	previousDirtImagePoint = nil
 end
@@ -332,29 +421,22 @@ JobStateChanged.OnClientEvent:Connect(function(state)
 		pendingCleanSegments = {}
 		pendingCleanLookup = {}
 		activeJobID = nil
-		for _, jobID in activeIncludedJobIDs do resetJobDirt(jobID) end
+		for _, jobID in activeIncludedJobIDs do
+			resetJobDirt(jobID, false)
+			if clearLiquidDirtForJob then clearLiquidDirtForJob(jobID) end
+		end
 		activeIncludedJobIDs = {}
 		activeIncludedLookup = {}
 	elseif state.State == "Completed" then
-		local completedHouse = activeIncludedLookup[HOUSE_JOB_ID] == true
-		local completedDriveway = activeIncludedLookup[DRIVEWAY_JOB_ID] == true
+		local completedJobIDs = table.clone(activeIncludedJobIDs)
 		pendingCleanSegments = {}
 		pendingCleanLookup = {}
 		activeJobID = nil
 		activeIncludedJobIDs = {}
 		activeIncludedLookup = {}
 		previousDirtImagePoint = nil
-		if completedHouse then
-			for _, canvas in houseDirtCanvases do
-				canvas.Part:Destroy()
-				canvas.Image:Destroy()
-			end
-			houseDirtCanvases = {}
-		end
-		if completedDriveway and drivewayDirtCanvas ~= nil then
-			drivewayDirtCanvas.Part:Destroy()
-			drivewayDirtCanvas.Image:Destroy()
-			drivewayDirtCanvas = nil
+		for _, completedJobID in completedJobIDs do
+			if clearLiquidDirtForJob then clearLiquidDirtForJob(completedJobID) end
 		end
 	end
 end)
@@ -416,12 +498,12 @@ local function cleanHighResolutionDirt(worldPosition: Vector3, pressureMultiplie
 	previousDirtImagePoint = imagePoint
 end
 
-local function destroyHouseLiquidDirt()
-	for _, canvas in houseDirtCanvases do
+local function destroySurfaceLiquidDirt(jobID: string)
+	for _, canvas in surfaceDirtCanvases[jobID] or {} do
 		canvas.Part:Destroy()
 		canvas.Image:Destroy()
 	end
-	houseDirtCanvases = {}
+	surfaceDirtCanvases[jobID] = {}
 end
 
 local function getStableSurfaceBasis(normal: Vector3): (Vector3, Vector3)
@@ -438,8 +520,10 @@ local function paintLiquidBlob(
 	centerY: number,
 	radiusX: number,
 	radiusY: number,
-	seed: number
+	seed: number,
+	jobID: string
 )
+	local isCarJob = getJobType(jobID) == "Car"
 	local minX = math.max(0, math.floor(centerX - radiusX * 1.2))
 	local maxX = math.min(width - 1, math.ceil(centerX + radiusX * 1.2))
 	local minY = math.max(0, math.floor(centerY - radiusY * 1.2))
@@ -463,7 +547,15 @@ local function paintLiquidBlob(
 					local red: number
 					local green: number
 					local blue: number
-					if stainNoise > 0.38 then
+					if isCarJob and stainNoise > 0.38 then
+						-- Muted moss, road film, and dirty runoff like the driveway.
+						red, green, blue = 73, 78, 42
+					elseif isCarJob and stainNoise < -0.42 then
+						red, green, blue = 111, 61, 30
+					elseif isCarJob then
+						local variation = math.floor(math.noise(x * 0.11, y * 0.11, seed) * 15)
+						red, green, blue = 91 + variation, 70 + math.floor(variation * 0.65), 43
+					elseif stainNoise > 0.38 then
 						-- Sickly organic grime mixed into the mud.
 						red, green, blue = 32, 39, 17
 					elseif stainNoise < -0.42 then
@@ -484,15 +576,16 @@ local function paintLiquidBlob(
 	end
 end
 
-local function buildHouseLiquidDirt()
-	destroyHouseLiquidDirt()
+local function buildSurfaceLiquidDirt(jobID: string)
+	destroySurfaceLiquidDirt(jobID)
 	local environment = Workspace:FindFirstChild("EnvironmentFixtures")
 	local jobSites = environment and environment:FindFirstChild("JobSites")
-	local site = jobSites and jobSites:FindFirstChild(HOUSE_JOB_ID)
+	local site = jobSites and jobSites:FindFirstChild(jobID)
 	local dirtFolder = site and site:FindFirstChild("DirtPixels")
 	if site == nil or dirtFolder == nil or site:GetAttribute("UsesLiquidDirtCanvas") ~= true then
 		return
 	end
+	local isCarJob = getJobType(jobID) == "Car"
 
 	local groups: {[string]: HouseSurfaceGroup} = {}
 	for _, descendant in dirtFolder:GetChildren() do
@@ -542,13 +635,14 @@ local function buildHouseLiquidDirt()
 		group.MaxV += margin
 		local spanU = math.max(0.25, group.MaxU - group.MinU)
 		local spanV = math.max(0.25, group.MaxV - group.MinV)
-		local width = math.clamp(math.ceil(spanV * HOUSE_PIXELS_PER_STUD), 48, 512)
-		local height = math.clamp(math.ceil(spanU * HOUSE_PIXELS_PER_STUD), 48, 512)
+		local pixelsPerStud = if isCarJob then 30 else HOUSE_PIXELS_PER_STUD
+		local width = math.clamp(math.ceil(spanV * pixelsPerStud), 48, 512)
+		local height = math.clamp(math.ceil(spanU * pixelsPerStud), 48, 512)
 		local success, editableResult = pcall(function()
 			return AssetService:CreateEditableImage({ Size = Vector2.new(width, height) })
 		end)
 		if not success or editableResult == nil then
-			warn("House liquid dirt canvas could not create an EditableImage.", editableResult)
+			warn(string.format("%s liquid dirt canvas could not create an EditableImage.", jobID), editableResult)
 			continue
 		end
 
@@ -560,14 +654,18 @@ local function buildHouseLiquidDirt()
 			local v = group.AxisV:Dot(patch.Position)
 			local pixelX = (group.MaxV - v) / spanV * (width - 1)
 			local pixelY = (group.MaxU - u) / spanU * (height - 1)
-			local worldRadius = math.clamp(math.max(patch.Size.Y, patch.Size.Z) * 0.95, 0.46, 0.88)
+			local worldRadius = if isCarJob
+				then math.clamp(math.max(patch.Size.Y, patch.Size.Z) * 0.82, 0.24, 0.54)
+				else math.clamp(math.max(patch.Size.Y, patch.Size.Z) * 0.95, 0.46, 0.88)
 			local radiusX = worldRadius / spanV * width * (0.76 + math.noise(patchIndex, 3, 9) * 0.72)
 			local radiusY = worldRadius / spanU * height * (0.82 + math.noise(7, patchIndex, 5) * 0.92)
-			paintLiquidBlob(pixels, width, height, pixelX, pixelY, radiusX, radiusY, patchIndex * 0.73)
+			paintLiquidBlob(pixels, width, height, pixelX, pixelY, radiusX, radiusY, patchIndex * 0.73, jobID)
 
 			-- Vertical surfaces occasionally grow narrow gravity-driven drips.
 			-- They taper and wander instead of forming straight geometric lines.
-			if math.abs(group.Normal.Y) < 0.3 and math.noise(patchIndex * 0.57, group.Plane, 21) > 0.06 then
+			if not isCarJob and math.abs(group.Normal.Y) < 0.3
+				and math.noise(patchIndex * 0.57, group.Plane, 21) > 0.06
+			then
 				local dripWorldLength = 0.45 + math.abs(math.noise(patchIndex, 14, 6)) * 1.7
 				local dripPixels = dripWorldLength / spanU * height
 				local dripSteps = math.max(3, math.ceil(dripPixels / math.max(radiusY * 0.55, 2)))
@@ -586,7 +684,8 @@ local function buildHouseLiquidDirt()
 						dripY,
 						math.max(1.5, radiusX * 0.38 * taper),
 						math.max(2, radiusY * 0.5 * taper),
-						patchIndex * 1.13 + alpha
+						patchIndex * 1.13 + alpha,
+						jobID
 					)
 				end
 			end
@@ -607,7 +706,8 @@ local function buildHouseLiquidDirt()
 				end
 			end
 
-			if nearestPoint ~= nil and nearestDistance > 0.05 and nearestDistance < 1.65 then
+			local maximumBridgeDistance = if isCarJob then 0.9 else 1.65
+			if nearestPoint ~= nil and nearestDistance > 0.05 and nearestDistance < maximumBridgeDistance then
 				local deltaU = u - nearestPoint.U
 				local deltaV = v - nearestPoint.V
 				local steps = math.max(2, math.ceil(nearestDistance / 0.16))
@@ -630,7 +730,8 @@ local function buildHouseLiquidDirt()
 						pathY,
 						radiusX * middleWeight * widthWobble,
 						radiusY * middleWeight,
-						patchIndex * 0.73 + alpha
+						patchIndex * 0.73 + alpha,
+						jobID
 					)
 				end
 			end
@@ -642,10 +743,10 @@ local function buildHouseLiquidDirt()
 		local centerV = (group.MinV + group.MaxV) * 0.5
 		local center = group.Normal * group.Plane + group.AxisU * centerU + group.AxisV * centerV
 		local canvasPart = Instance.new("Part")
-		canvasPart.Name = string.format("LocalHouseDirtCanvas_%02d", canvasIndex)
+		canvasPart.Name = string.format("LocalLiquidDirtCanvas_%s_%02d", jobID, canvasIndex)
 		canvasPart.Size = Vector3.new(0.004, spanU, spanV)
 		canvasPart.CFrame = CFrame.fromMatrix(
-			center + group.Normal * 0.003,
+			center + group.Normal * (if isCarJob then 0.015 else 0.003),
 			group.Normal,
 			group.AxisU,
 			group.AxisV
@@ -674,7 +775,12 @@ local function buildHouseLiquidDirt()
 		imageLabel.ImageContent = Content.fromObject(editable)
 		imageLabel.Parent = surface
 
-		table.insert(houseDirtCanvases, {
+		local jobCanvases = surfaceDirtCanvases[jobID]
+		if jobCanvases == nil then
+			jobCanvases = {}
+			surfaceDirtCanvases[jobID] = jobCanvases
+		end
+		table.insert(jobCanvases, {
 			Part = canvasPart,
 			Image = editable,
 			Pixels = pixels,
@@ -690,19 +796,23 @@ local function buildHouseLiquidDirt()
 			MaxV = group.MaxV,
 		})
 	end
-	print(string.format("DIAGNOSTIC: Created %d high-resolution house dirt canvases.", #houseDirtCanvases))
+	print(string.format(
+		"DIAGNOSTIC: Created %d high-resolution %s dirt canvases.",
+		#(surfaceDirtCanvases[jobID] or {}),
+		jobID
+	))
 end
 
-rebuildHouseLiquidDirt = buildHouseLiquidDirt
-
-local function cleanHouseLiquidDirt(
+local function cleanSurfaceLiquidDirt(
+	jobID: string,
 	worldPosition: Vector3,
 	surfaceNormal: Vector3,
 	pressureMultiplier: number,
 	brushScale: number,
 	deltaTime: number
 )
-	for _, canvas in houseDirtCanvases do
+	local isCarJob = getJobType(jobID) == "Car"
+	for _, canvas in surfaceDirtCanvases[jobID] or {} do
 		if canvas.Normal:Dot(surfaceNormal) < 0.62 then
 			continue
 		end
@@ -721,7 +831,8 @@ local function cleanHouseLiquidDirt(
 		local pixelY = (canvas.MaxU - u) / spanU * (canvas.Height - 1)
 		local configuredWidth = PLAYER:GetAttribute("WasherSprayWidth")
 		local washerWidth = if typeof(configuredWidth) == "number" then math.max(configuredWidth, 0.1) else 1
-		local worldRadius = BASE_WORLD_BRUSH_RADIUS * brushScale * HOUSE_BRUSH_RADIUS_MULTIPLIER * washerWidth
+		local radiusMultiplier = if isCarJob then CAR_BRUSH_RADIUS_MULTIPLIER else HOUSE_BRUSH_RADIUS_MULTIPLIER
+		local worldRadius = BASE_WORLD_BRUSH_RADIUS * brushScale * radiusMultiplier * washerWidth
 		local radiusX = math.max(2, worldRadius / spanV * canvas.Width)
 		local radiusY = math.max(2, worldRadius / spanU * canvas.Height)
 		local minX = math.max(0, math.floor(pixelX - radiusX))
@@ -744,7 +855,7 @@ local function cleanHouseLiquidDirt(
 					local fade = math.max(1, math.floor(
 						(145 + 430 * strength)
 							* pressureMultiplier
-							* HOUSE_VISUAL_FADE_MULTIPLIER
+							* (if isCarJob then 0.9 else HOUSE_VISUAL_FADE_MULTIPLIER)
 							* deltaTime
 					))
 					buffer.writeu8(canvas.Pixels, fullIndex + 3, math.max(0, alpha - fade))
@@ -761,12 +872,14 @@ local function cleanHouseLiquidDirt(
 end
 
 local function destroyDrivewayLiquidDirt()
+	previousDrivewayImagePoint = nil
 	if drivewayDirtCanvas == nil then
 		return
 	end
 	drivewayDirtCanvas.Part:Destroy()
 	drivewayDirtCanvas.Image:Destroy()
 	drivewayDirtCanvas = nil
+	drivewayDirtJobID = nil
 end
 
 local function fillDrivewayDirtBuffer(source: BasePart, pixels: buffer, width: number, height: number)
@@ -831,11 +944,11 @@ local function fillDrivewayDirtBuffer(source: BasePart, pixels: buffer, width: n
 	end
 end
 
-local function buildDrivewayLiquidDirt()
+local function buildDrivewayLiquidDirt(jobID: string)
 	destroyDrivewayLiquidDirt()
 	local environment = Workspace:FindFirstChild("EnvironmentFixtures")
 	local jobSites = environment and environment:FindFirstChild("JobSites")
-	local site = jobSites and jobSites:FindFirstChild(DRIVEWAY_JOB_ID)
+	local site = jobSites and jobSites:FindFirstChild(jobID)
 	local dirtFolder = site and site:FindFirstChild("DirtPixels")
 	if site == nil or dirtFolder == nil or site:GetAttribute("UsesLiquidDirtCanvas") ~= true then
 		return
@@ -870,6 +983,10 @@ local function buildDrivewayLiquidDirt()
 	local editable = editableResult :: EditableImage
 	local pixels = buffer.create(width * height * 4)
 	fillDrivewayDirtBuffer(source, pixels, width, height)
+	local targetAlpha = buffer.create(width * height)
+	for pixelIndex = 0, width * height - 1 do
+		buffer.writeu8(targetAlpha, pixelIndex, buffer.readu8(pixels, pixelIndex * 4 + 3))
+	end
 	editable:WritePixelsBuffer(Vector2.zero, Vector2.new(width, height), pixels)
 
 	local canvasPart = Instance.new("Part")
@@ -907,13 +1024,31 @@ local function buildDrivewayLiquidDirt()
 		Source = source,
 		Image = editable,
 		Pixels = pixels,
+		TargetAlpha = targetAlpha,
+		DirtyTiles = {},
+		TileColumns = math.ceil(width / DRIVEWAY_FADE_TILES_SIZE),
 		Width = width,
 		Height = height,
 	}
+	drivewayDirtJobID = jobID
 	print(string.format("DIAGNOSTIC: Created a %dx%d non-repeating driveway dirt canvas.", width, height))
 end
 
-rebuildDrivewayLiquidDirt = buildDrivewayLiquidDirt
+rebuildLiquidDirtForJob = function(jobID: string)
+	local site = getJobSite(jobID)
+	if site == nil or site:GetAttribute("UsesLiquidDirtCanvas") ~= true then return end
+	local jobType = getJobType(jobID)
+	if jobType == "Driveway" then
+		buildDrivewayLiquidDirt(jobID)
+	elseif jobType == "Car" or jobType == "House" or jobType == "Mansion" then
+		buildSurfaceLiquidDirt(jobID)
+	end
+end
+
+clearLiquidDirtForJob = function(jobID: string)
+	destroySurfaceLiquidDirt(jobID)
+	if drivewayDirtJobID == jobID then destroyDrivewayLiquidDirt() end
+end
 
 local function cleanDrivewayLiquidDirt(
 	worldPosition: Vector3,
@@ -932,83 +1067,106 @@ local function cleanDrivewayLiquidDirt(
 	local pixelY = v * (canvas.Height - 1)
 	local radiusX = math.max(2, worldBrushRadius / canvas.Source.Size.X * canvas.Width)
 	local radiusY = math.max(2, worldBrushRadius / canvas.Source.Size.Z * canvas.Height)
+	local imagePoint = Vector2.new(pixelX, pixelY)
+	local previousPoint = previousDrivewayImagePoint or imagePoint
+	local normalizedJump = Vector2.new(
+		(imagePoint.X - previousPoint.X) / radiusX,
+		(imagePoint.Y - previousPoint.Y) / radiusY
+	).Magnitude
+	-- Do not turn a cursor teleport across the screen into a giant clean stripe
+	-- or an unnecessarily large image-buffer update.
+	if normalizedJump > 7 then previousPoint = imagePoint end
+	local scaledPrevious = Vector2.new(previousPoint.X / radiusX, previousPoint.Y / radiusY)
+	local scaledCurrent = Vector2.new(pixelX / radiusX, pixelY / radiusY)
 	local configuredCleanSpeed = PLAYER:GetAttribute("WasherCleanSpeed")
 	local cleanSpeed = if typeof(configuredCleanSpeed) == "number" then configuredCleanSpeed else DEFAULT_CLEAN_SPEED
 	local rawWasherPowerScale = math.clamp(cleanSpeed / DEFAULT_CLEAN_SPEED, 1, 4)
-	local washerPowerScale = if rawWasherPowerScale <= 2.3
-		then rawWasherPowerScale
-		else 2.3 + (rawWasherPowerScale - 2.3) * 0.25
-	local minX = math.max(0, math.floor(pixelX - radiusX))
-	local maxX = math.min(canvas.Width - 1, math.ceil(pixelX + radiusX))
-	local minY = math.max(0, math.floor(pixelY - radiusY))
-	local maxY = math.min(canvas.Height - 1, math.ceil(pixelY + radiusY))
-	local regionWidth = maxX - minX + 1
-	local regionHeight = maxY - minY + 1
-	local region = buffer.create(regionWidth * regionHeight * 4)
-
+	-- Preserve the deliberately compressed driveway radius, but let upgraded
+	-- pressure apply its full tier multiplier to the mud fade.
+	local washerPowerScale = SharedShopData.GetDrivewayPowerScale(cleanSpeed)
+	local minX = math.max(0, math.floor(math.min(previousPoint.X, pixelX) - radiusX))
+	local maxX = math.min(canvas.Width - 1, math.ceil(math.max(previousPoint.X, pixelX) + radiusX))
+	local minY = math.max(0, math.floor(math.min(previousPoint.Y, pixelY) - radiusY))
+	local maxY = math.min(canvas.Height - 1, math.ceil(math.max(previousPoint.Y, pixelY) + radiusY))
 	for y = minY, maxY do
 		for x = minX, maxX do
-			local dx = (x - pixelX) / radiusX
-			local dy = (y - pixelY) / radiusY
-			local distance = math.sqrt(dx * dx + dy * dy)
-			local fullIndex = (y * canvas.Width + x) * 4
+			-- Fill the entire cursor path since the previous rendered frame. This
+			-- removes the visible chain of individual stamps at Industrial speed.
+			local distance = distanceToStroke(
+				Vector2.new(x / radiusX, y / radiusY),
+				scaledPrevious,
+				scaledCurrent
+			)
 			if distance <= 1 then
 				local strength = (1 - distance) ^ 0.72
-				local alpha = buffer.readu8(canvas.Pixels, fullIndex + 3)
+				local alphaIndex = y * canvas.Width + x
+				local targetAlpha = buffer.readu8(canvas.TargetAlpha, alphaIndex)
 				local fade = math.max(1, math.floor(
 					(115 + 310 * strength) * pressureMultiplier * washerPowerScale * deltaTime
 				))
-				buffer.writeu8(canvas.Pixels, fullIndex + 3, math.max(0, alpha - fade))
+				local nextTarget = math.max(0, targetAlpha - fade)
+				if nextTarget < targetAlpha then
+					buffer.writeu8(canvas.TargetAlpha, alphaIndex, nextTarget)
+					local tileX = math.floor(x / DRIVEWAY_FADE_TILES_SIZE)
+					local tileY = math.floor(y / DRIVEWAY_FADE_TILES_SIZE)
+					canvas.DirtyTiles[tileY * canvas.TileColumns + tileX] = true
+				end
 			end
-			local regionIndex = ((y - minY) * regionWidth + (x - minX)) * 4
-			buffer.writeu8(region, regionIndex, buffer.readu8(canvas.Pixels, fullIndex))
-			buffer.writeu8(region, regionIndex + 1, buffer.readu8(canvas.Pixels, fullIndex + 1))
-			buffer.writeu8(region, regionIndex + 2, buffer.readu8(canvas.Pixels, fullIndex + 2))
-			buffer.writeu8(region, regionIndex + 3, buffer.readu8(canvas.Pixels, fullIndex + 3))
 		end
 	end
-	canvas.Image:WritePixelsBuffer(Vector2.new(minX, minY), Vector2.new(regionWidth, regionHeight), region)
+	previousDrivewayImagePoint = imagePoint
 end
 
+local function advanceDrivewayDirtFade(deltaTime: number)
+	local canvas = drivewayDirtCanvas
+	if canvas == nil or next(canvas.DirtyTiles) == nil then return end
+	local configuredCleanSpeed = PLAYER:GetAttribute("WasherCleanSpeed")
+	local cleanSpeed = if typeof(configuredCleanSpeed) == "number" then configuredCleanSpeed else DEFAULT_CLEAN_SPEED
+	local totalPower = SharedShopData.GetDrivewayPowerScale(cleanSpeed)
+	local tierAlpha = math.sqrt(math.clamp((totalPower - 1) / 13, 0, 1))
+	local displayFadeRate = DRIVEWAY_MIN_DISPLAY_FADE_PER_SECOND
+		+ (DRIVEWAY_MAX_DISPLAY_FADE_PER_SECOND - DRIVEWAY_MIN_DISPLAY_FADE_PER_SECOND) * tierAlpha
+	local alphaStep = math.max(1, math.floor(displayFadeRate * math.min(deltaTime, 0.05)))
+	for tileKey in canvas.DirtyTiles do
+		local tileX = tileKey % canvas.TileColumns
+		local tileY = math.floor(tileKey / canvas.TileColumns)
+		local minX = tileX * DRIVEWAY_FADE_TILES_SIZE
+		local minY = tileY * DRIVEWAY_FADE_TILES_SIZE
+		local maxX = math.min(canvas.Width - 1, minX + DRIVEWAY_FADE_TILES_SIZE - 1)
+		local maxY = math.min(canvas.Height - 1, minY + DRIVEWAY_FADE_TILES_SIZE - 1)
+		local regionWidth = maxX - minX + 1
+		local regionHeight = maxY - minY + 1
+		local region = buffer.create(regionWidth * regionHeight * 4)
+		local settled = true
+
+		for y = minY, maxY do
+			for x = minX, maxX do
+				local alphaIndex = y * canvas.Width + x
+				local fullIndex = alphaIndex * 4
+				local currentAlpha = buffer.readu8(canvas.Pixels, fullIndex + 3)
+				local targetAlpha = buffer.readu8(canvas.TargetAlpha, alphaIndex)
+				if currentAlpha > targetAlpha then
+					currentAlpha = math.max(targetAlpha, currentAlpha - alphaStep)
+					buffer.writeu8(canvas.Pixels, fullIndex + 3, currentAlpha)
+				end
+				if currentAlpha ~= targetAlpha then settled = false end
+
+				local regionIndex = ((y - minY) * regionWidth + (x - minX)) * 4
+				buffer.writeu8(region, regionIndex, buffer.readu8(canvas.Pixels, fullIndex))
+				buffer.writeu8(region, regionIndex + 1, buffer.readu8(canvas.Pixels, fullIndex + 1))
+				buffer.writeu8(region, regionIndex + 2, buffer.readu8(canvas.Pixels, fullIndex + 2))
+				buffer.writeu8(region, regionIndex + 3, currentAlpha)
+			end
+		end
+		canvas.Image:WritePixelsBuffer(Vector2.new(minX, minY), Vector2.new(regionWidth, regionHeight), region)
+		if settled then canvas.DirtyTiles[tileKey] = nil end
+	end
+end
+
+-- Liquid EditableImages are intentionally created only when a job becomes
+-- active. This keeps additional authored cars and houses essentially free for
+-- clients who are cleaning somewhere else.
 task.spawn(initializeHighResolutionDirt)
-task.spawn(function()
-	local environment = Workspace:WaitForChild("EnvironmentFixtures", 15)
-	local jobSites = environment and environment:WaitForChild("JobSites", 15)
-	local site = if jobSites then jobSites:WaitForChild(HOUSE_JOB_ID, 15) else nil
-	local dirtFolder = site and site:WaitForChild("DirtPixels", 15)
-	if site and dirtFolder then
-		local deadline = os.clock() + 15
-		repeat
-			local expectedCount = site:GetAttribute("DirtPatchCount")
-			if typeof(expectedCount) == "number" and expectedCount > 0
-				and #dirtFolder:GetChildren() >= expectedCount
-			then
-				break
-			end
-			task.wait(0.1)
-		until os.clock() >= deadline
-	end
-	buildHouseLiquidDirt()
-end)
-task.spawn(function()
-	local environment = Workspace:WaitForChild("EnvironmentFixtures", 15)
-	local jobSites = environment and environment:WaitForChild("JobSites", 15)
-	local site = if jobSites then jobSites:WaitForChild(DRIVEWAY_JOB_ID, 15) else nil
-	local dirtFolder = site and site:WaitForChild("DirtPixels", 15)
-	if site and dirtFolder then
-		local deadline = os.clock() + 15
-		repeat
-			local expectedCount = site:GetAttribute("DirtPatchCount")
-			if typeof(expectedCount) == "number" and expectedCount > 0
-				and #dirtFolder:GetChildren() >= expectedCount
-			then
-				break
-			end
-			task.wait(0.1)
-		until os.clock() >= deadline
-	end
-	buildDrivewayLiquidDirt()
-end)
 
 local function getCleanSpeed(): number
 	local configuredSpeed = PLAYER:GetAttribute("WasherCleanSpeed")
@@ -1041,9 +1199,115 @@ local function getNozzle(tool: Tool): BasePart?
 	return nil
 end
 
+local function createSpraySoundLayer(
+	nozzle: BasePart,
+	name: string,
+	soundID: string,
+	mixVolume: number,
+	lowGain: number,
+	midGain: number,
+	highGain: number
+): Sound
+	local existing = nozzle:FindFirstChild(name)
+	if existing ~= nil then existing:Destroy() end
+	local sound = Instance.new("Sound")
+	sound.Name = name
+	sound.SoundId = soundID
+	sound.Looped = true
+	sound.Volume = 0
+	sound.RollOffMode = Enum.RollOffMode.InverseTapered
+	sound.RollOffMinDistance = 5
+	sound.RollOffMaxDistance = 75
+	sound:SetAttribute("MixVolume", mixVolume)
+	sound.Parent = nozzle
+
+	local equalizer = Instance.new("EqualizerSoundEffect")
+	equalizer.Name = "PressureWasherEQ"
+	equalizer.LowGain = lowGain
+	equalizer.MidGain = midGain
+	equalizer.HighGain = highGain
+	equalizer.Parent = sound
+	return sound
+end
+
+local function ensureSpraySounds(tool: Tool): {Sound}
+	local nozzle = getNozzle(tool)
+	if nozzle == nil then return {} end
+	local legacy = nozzle:FindFirstChild("PressureWasherSprayLoop")
+	if legacy ~= nil then legacy:Destroy() end
+	return {
+		createSpraySoundLayer(
+			nozzle,
+			"PressureWasherJet",
+			SPRAY_JET_SOUND_ID,
+			SPRAY_JET_VOLUME,
+			-2,
+			2,
+			3
+		),
+		createSpraySoundLayer(
+			nozzle,
+			"PressureWasherBody",
+			SPRAY_BODY_SOUND_ID,
+			SPRAY_BODY_VOLUME,
+			4,
+			1,
+			-7
+		),
+	}
+end
+
+local function setSpraySoundEnabled(enabled: boolean)
+	spraySoundGeneration += 1
+	local generation = spraySoundGeneration
+	for _, tween in spraySoundTweens do tween:Cancel() end
+	spraySoundTweens = {}
+	local sounds = table.clone(sprayLoopSounds)
+	if #sounds == 0 then return end
+
+	if enabled then
+		local configuredCleanSpeed = PLAYER:GetAttribute("WasherCleanSpeed")
+		local cleanSpeed = if typeof(configuredCleanSpeed) == "number" then configuredCleanSpeed else DEFAULT_CLEAN_SPEED
+		local tierScale = math.clamp(cleanSpeed / DEFAULT_CLEAN_SPEED, 1, 4)
+		local configuredSFXVolume = PLAYER:GetAttribute("SFXVolume")
+		local sfxVolume = if typeof(configuredSFXVolume) == "number"
+			then math.clamp(configuredSFXVolume, 0, 1)
+			else 1
+		for index, sound in sounds do
+			if sound.Parent == nil then continue end
+			sound.PlaybackSpeed = if index == 1
+				then 0.97 + (tierScale - 1) * 0.025
+				else 0.78 + (tierScale - 1) * 0.018
+			if not sound.IsPlaying then sound:Play() end
+			local mixVolume = sound:GetAttribute("MixVolume")
+			local targetVolume = if typeof(mixVolume) == "number" then mixVolume * sfxVolume else 0
+			local tween = TweenService:Create(sound, TweenInfo.new(SPRAY_SOUND_FADE_IN), {
+				Volume = targetVolume,
+			})
+			table.insert(spraySoundTweens, tween)
+			tween:Play()
+		end
+	else
+		for _, sound in sounds do
+			if sound.Parent == nil then continue end
+			local tween = TweenService:Create(sound, TweenInfo.new(SPRAY_SOUND_FADE_OUT), { Volume = 0 })
+			table.insert(spraySoundTweens, tween)
+			tween:Play()
+		end
+		task.delay(SPRAY_SOUND_FADE_OUT + 0.02, function()
+			if spraySoundGeneration == generation and not isSpraying then
+				for _, sound in sounds do
+					if sound.Parent ~= nil then sound:Stop() end
+				end
+			end
+		end)
+	end
+end
+
 local function setSprayEnabled(enabled: boolean)
 	local wasSpraying = isSpraying
 	isSpraying = enabled and activeTool ~= nil
+	setSpraySoundEnabled(isSpraying)
 	if sprayEmitter ~= nil then
 		sprayEmitter.Enabled = isSpraying
 	end
@@ -1070,22 +1334,26 @@ local function setSprayEnabled(enabled: boolean)
 	end
 	if not isSpraying then
 		previousDirtImagePoint = nil
+		previousDrivewayImagePoint = nil
 	end
 end
 
 local function getPressureMultiplier(distance: number): number
 	local rangeMultiplier = getWasherStat("WasherEffectiveRange", 1)
 	local fullPressureDistance = FULL_PRESSURE_DISTANCE * rangeMultiplier
-	local pressureFalloffDistance = PRESSURE_FALLOFF_DISTANCE * rangeMultiplier
+	local maximumCleanDistance = MAX_EFFECTIVE_CLEAN_DISTANCE * rangeMultiplier
 	if distance <= fullPressureDistance then
 		return 1
 	end
-	local falloff = (distance - fullPressureDistance) / pressureFalloffDistance
+	if distance >= maximumCleanDistance then
+		return 0
+	end
+	local falloff = (distance - fullPressureDistance) / (maximumCleanDistance - fullPressureDistance)
 	-- Pressure loses useful cleaning force faster than the stream loses visual
 	-- reach. Close passes cut through mud; distant passes still work but meet
 	-- noticeable resistance and require dwelling on the stain.
 	local normalizedPressure = math.clamp(1 - falloff, 0, 1)
-	return math.max(normalizedPressure ^ DISTANCE_RESISTANCE_EXPONENT, MIN_PRESSURE_MULTIPLIER)
+	return normalizedPressure ^ DISTANCE_RESISTANCE_EXPONENT
 end
 
 local function flushCleanReports()
@@ -1095,7 +1363,15 @@ local function flushCleanReports()
 	local batch = pendingCleanSegments
 	pendingCleanSegments = {}
 	pendingCleanLookup = {}
-	CleanSegmentRequest:FireServer(batch)
+	-- The server deliberately caps each packet. Chunking here prevents a fast,
+	-- wide washer from silently losing every region after the packet limit.
+	for first = 1, #batch, 96 do
+		local chunk: {Instance} = {}
+		for index = first, math.min(first + 95, #batch) do
+			table.insert(chunk, batch[index])
+		end
+		CleanSegmentRequest:FireServer(chunk)
+	end
 end
 
 local function clearWaterStream()
@@ -1251,8 +1527,10 @@ local function ensureWaterStream(tool: Tool)
 	mudRunoffEmitter = runoff
 end
 
-local function updateWaterStream(position: Vector3, hasImpact: boolean, mudIntensity: number)
-	local useWideHouseSpray = currentSprayJobID == HOUSE_JOB_ID
+local function updateWaterStream(position: Vector3, hasImpact: boolean, mudIntensity: number, pressure: number)
+	local visiblePressure = math.clamp(pressure, 0, 1)
+	local currentJobType = getJobType(currentSprayJobID)
+	local useWideHouseSpray = currentJobType == "House" or currentJobType == "Mansion"
 	if useWideHouseSpray ~= houseSprayVisualActive then
 		houseSprayVisualActive = useWideHouseSpray
 		if sprayEmitter then
@@ -1303,6 +1581,11 @@ local function updateWaterStream(position: Vector3, hasImpact: boolean, mudInten
 		local visualMultiplier = (if useWideHouseSpray then HOUSE_SPRAY_VISUAL_MULTIPLIER else 1) * washerWidth
 		waterBeam.Width0 = 0.2 * math.sqrt(visualMultiplier)
 		waterBeam.Width1 = math.clamp(0.24 + distance * 0.0022, 0.25, 0.38) * visualMultiplier
+		waterBeam.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.22 + (1 - visiblePressure) * 0.12),
+			NumberSequenceKeypoint.new(0.7, 0.52 + (1 - visiblePressure) * 0.2),
+			NumberSequenceKeypoint.new(1, 0.82 + (1 - visiblePressure) * 0.16),
+		})
 
 		-- Aim the droplet emitter through the exact cursor impact point. The
 		-- particles carry the stream visually; the Beam is only a faint pressure
@@ -1317,14 +1600,18 @@ local function updateWaterStream(position: Vector3, hasImpact: boolean, mudInten
 			-- not disappear before reaching a distant cursor impact point.
 			sprayEmitter.Lifetime = NumberRange.new(math.clamp(distance / 88 + 0.06, 0.08, 1.45))
 			local baseRate = math.clamp(245 + distance * 0.8, 260, 335)
-			sprayEmitter.Rate = baseRate * (if useWideHouseSpray then 1.28 else 1)
+			sprayEmitter.Rate = baseRate
+				* (if useWideHouseSpray then 1.28 else 1)
+				* (0.35 + 0.65 * math.sqrt(visiblePressure))
 		end
 	end
 	if impactEmitter then
 		impactEmitter.Enabled = isSpraying and hasImpact
+		impactEmitter.Rate = (if useWideHouseSpray then 220 else 145) * (0.3 + 0.7 * visiblePressure)
 	end
 	if waterSplashEmitter then
 		waterSplashEmitter.Enabled = isSpraying and hasImpact
+		waterSplashEmitter.Rate = (if useWideHouseSpray then 390 else 285) * (0.3 + 0.7 * visiblePressure)
 	end
 	if mudRunoffEmitter then
 		local isWashingMud = isSpraying and mudIntensity > 0
@@ -1450,7 +1737,8 @@ end
 local function gatherNearbyDirtPatches(folder: Instance, hitPosition: Vector3, worldRadius: number): {Instance}
 	local patches: {Instance} = {}
 	local site = folder.Parent
-	if site ~= nil and site:GetAttribute("JobID") == DRIVEWAY_JOB_ID then
+	local siteJobID = site and site:GetAttribute("JobID")
+	if typeof(siteJobID) == "string" and getJobType(siteJobID) == "Driveway" then
 		local spatialIndex = drivewayDirtSpatialCache[folder]
 		if spatialIndex == nil then
 			local cellSize = 2.5
@@ -1573,6 +1861,36 @@ local function findDirtSegments(
 	return {}
 end
 
+local function getAuthoredSurfaceNormal(instance: Instance, fallback: Vector3): Vector3
+	local patch: Instance? = instance
+	if instance:GetAttribute("DirtVisualLobe") == true then patch = instance.Parent end
+	if patch ~= nil and patch:IsA("BasePart") and patch:GetAttribute("DirtPatch") == true then
+		return patch.CFrame.RightVector
+	end
+	return fallback
+end
+
+local function getClosestSegment(segments: {Instance}, hitPosition: Vector3): Instance?
+	local closest: Instance? = nil
+	local closestDistance = math.huge
+	for _, segment in segments do
+		local position: Vector3? = nil
+		if segment:IsA("BasePart") then
+			position = segment.Position
+		elseif segment:IsA("Decal") and segment.Parent and segment.Parent:IsA("BasePart") then
+			position = segment.Parent.Position
+		end
+		if position ~= nil then
+			local distance = (position - hitPosition).Magnitude
+			if distance < closestDistance then
+				closest = segment
+				closestDistance = distance
+			end
+		end
+	end
+	return closest or segments[1]
+end
+
 local function finishSegment(segment: Instance)
 	if not CollectionService:HasTag(segment, DIRT_TAG) then
 		return
@@ -1600,7 +1918,55 @@ local function finishSegment(segment: Instance)
 	end
 end
 
-local function cleanSegment(segment: Instance, _deltaTime: number, pressureMultiplier: number)
+local function restoreRejectedSegment(segment: Instance)
+	local segmentJobID = segment:GetAttribute("JobID")
+	-- Ignore late responses after a job has completed or been closed. A
+	-- completion response and the final batch acknowledgment can cross frames.
+	if typeof(segmentJobID) ~= "string" or activeIncludedLookup[segmentJobID] ~= true then
+		return
+	end
+
+	segmentProgress[segment] = nil
+	activeCleanTweens[segment] = nil
+	pendingCleanLookup[segment] = nil
+	if segment:IsA("BasePart") then
+		local original = segment:GetAttribute("OriginalTransparency")
+		if typeof(original) ~= "number" then original = originalPartTransparency[segment] end
+		if typeof(original) == "number" then segment.Transparency = original end
+		segment.CanQuery = true
+		for _, child in segment:GetChildren() do
+			if child:IsA("BasePart") and child:GetAttribute("DirtVisualLobe") == true then
+				local lobeOriginal = child:GetAttribute("OriginalTransparency")
+				if typeof(lobeOriginal) ~= "number" then lobeOriginal = originalPartTransparency[child] end
+				if typeof(lobeOriginal) == "number" then child.Transparency = lobeOriginal end
+				child.CanQuery = true
+			elseif child:IsA("Decal") and child:GetAttribute("DirtVisual") == true then
+				local decalOriginal = child:GetAttribute("OriginalTransparency")
+				if typeof(decalOriginal) == "number" then child.Transparency = decalOriginal end
+			end
+		end
+	elseif segment:IsA("Decal") then
+		local original = segment:GetAttribute("OriginalTransparency")
+		segment.Transparency = if typeof(original) == "number" then original else 0
+	elseif segment:IsA("Frame") then
+		local original = segment:GetAttribute("OriginalTransparency")
+		if typeof(original) ~= "number" then original = originalGuiTransparency[segment] end
+		if typeof(original) == "number" then segment.BackgroundTransparency = original end
+		segment.Visible = true
+	end
+	if not CollectionService:HasTag(segment, DIRT_TAG) then
+		CollectionService:AddTag(segment, DIRT_TAG)
+	end
+end
+
+CleanSegmentResult.OnClientEvent:Connect(function(rejectedSegments)
+	if typeof(rejectedSegments) ~= "table" then return end
+	for _, segment in rejectedSegments do
+		if typeof(segment) == "Instance" then restoreRejectedSegment(segment) end
+	end
+end)
+
+local function cleanSegment(segment: Instance, deltaTime: number, pressureMultiplier: number)
 	if activeCleanTweens[segment] then
 		return
 	end
@@ -1621,20 +1987,29 @@ local function cleanSegment(segment: Instance, _deltaTime: number, pressureMulti
 	if typeof(configuredCleanPower) == "number" then
 		powerMultiplier *= math.clamp(configuredCleanPower, 0.5, 4)
 	end
-	if segment:GetAttribute("JobID") == HOUSE_JOB_ID then
+	local segmentJobID = segment:GetAttribute("JobID")
+	local segmentJobType = if typeof(segmentJobID) == "string" then getJobType(segmentJobID) else nil
+	if segmentJobType == "House" or segmentJobType == "Mansion" then
 		powerMultiplier *= HOUSE_CLEAN_POWER_MULTIPLIER
+	elseif segmentJobType == "Driveway" then
+		local rawPowerScale = math.clamp(getCleanSpeed() / DEFAULT_CLEAN_SPEED, 1, 4)
+		local totalDrivewayPower = SharedShopData.GetDrivewayPowerScale(getCleanSpeed())
+		powerMultiplier *= totalDrivewayPower / rawPowerScale
 	end
 	local configuredResistance = segment:GetAttribute("DirtResistance")
 	local dirtResistance = if typeof(configuredResistance) == "number"
 		then math.clamp(configuredResistance, 0.5, 2.5)
 		else 1
-	local targetProgress = math.min(
-		1,
-		currentProgress + getCleanSpeed() * CLEAN_TWEEN_STEP * powerMultiplier * pressureMultiplier / dirtResistance
-	)
 	local dirtFolder = segment.Parent
 	local jobSite = dirtFolder and dirtFolder.Parent
 	local usesLiquidCanvas = isDirtPixel and jobSite ~= nil and jobSite:GetAttribute("UsesLiquidDirtCanvas") == true
+	-- Liquid canvases are updated every rendered frame. Use real frame time here;
+	-- the old fixed 0.1 step made them clean roughly six times too quickly.
+	local cleanStep = if usesLiquidCanvas then math.min(deltaTime, 0.05) else CLEAN_TWEEN_STEP
+	local targetProgress = math.min(
+		1,
+		currentProgress + getCleanSpeed() * cleanStep * powerMultiplier * pressureMultiplier / dirtResistance
+	)
 	if usesLiquidCanvas then
 		-- Liquid-canvas jobs render their fade in one EditableImage. Their
 		-- transparent validation parts do not need hundreds of redundant Tweens.
@@ -1713,16 +2088,29 @@ local function connectTool(tool: Tool)
 
 	tool.Equipped:Connect(function()
 		activeTool = tool
+		setAimCursorEnabled(true)
 		ensureWaterStream(tool)
 		sprayEmitter = ensureSprayEmitter(tool)
+		sprayLoopSounds = ensureSpraySounds(tool)
 	end)
 
 	tool.Unequipped:Connect(function()
 		if activeTool == tool then
 			setSprayEnabled(false)
+			setAimCursorEnabled(false)
 			clearWaterStream()
 			activeTool = nil
 			sprayEmitter = nil
+			sprayLoopSounds = {}
+		end
+	end)
+
+	tool.Destroying:Connect(function()
+		if activeTool == tool then
+			setSprayEnabled(false)
+			setAimCursorEnabled(false)
+			activeTool = nil
+			sprayLoopSounds = {}
 		end
 	end)
 
@@ -1783,6 +2171,8 @@ UserInputService.InputEnded:Connect(function(input)
 end)
 
 RunService.RenderStepped:Connect(function(deltaTime)
+	updateAimCursor()
+	advanceDrivewayDirtFade(deltaTime)
 	cleanReportAccumulator += deltaTime
 	if cleanReportAccumulator >= CLEAN_REPORT_INTERVAL then
 		cleanReportAccumulator %= CLEAN_REPORT_INTERVAL
@@ -1822,8 +2212,10 @@ RunService.RenderStepped:Connect(function(deltaTime)
 	raycastParams.FilterDescendantsInstances = { character, activeTool }
 	raycastParams.IgnoreWater = true
 
-	-- Aim through the actual cursor from the camera first. mouse.Hit can fall
-	-- back to an unrelated world CFrame when it has no reliable target.
+	-- The camera chooses the desired cursor point, but the physical spray is
+	-- raycast again from the nozzle. The second cast makes walls, roofs, cars,
+	-- and every other queryable surface block the stream instead of letting the
+	-- camera shoot through them.
 	local cursorRay = getCursorRay()
 	if cursorRay == nil or cursorRay.Direction.Magnitude < 0.001 then
 		if shouldReportWater then
@@ -1831,64 +2223,102 @@ RunService.RenderStepped:Connect(function(deltaTime)
 		end
 		return
 	end
-	local cursorResult = Workspace:Raycast(
+	local rangeMultiplier = getWasherStat("WasherEffectiveRange", 1)
+	local cameraResult = Workspace:Raycast(
 		cursorRay.Origin,
-		cursorRay.Direction.Unit * MAX_SPRAY_DISTANCE * getWasherStat("WasherEffectiveRange", 1),
+		cursorRay.Direction.Unit * MAX_VISUAL_SPRAY_DISTANCE * rangeMultiplier,
 		raycastParams
 	)
-	local target = if cursorResult
-		then cursorResult.Position
-		else cursorRay.Origin + cursorRay.Direction.Unit * MAX_SPRAY_DISTANCE * getWasherStat("WasherEffectiveRange", 1)
 	local origin = nozzle.Position
+	local desiredTarget = if cameraResult
+		then cameraResult.Position
+		else cursorRay.Origin + cursorRay.Direction.Unit * MAX_VISUAL_SPRAY_DISTANCE * rangeMultiplier
+	local desiredOffset = desiredTarget - origin
+	if desiredOffset.Magnitude < 0.01 then
+		updateWaterStream(origin, false, 0, 0)
+		return
+	end
+	local physicalLength = math.min(desiredOffset.Magnitude, MAX_VISUAL_SPRAY_DISTANCE * rangeMultiplier)
+	-- A camera-selected dirt plane is only a few thousandths of a stud thick.
+	-- Cast slightly behind that selected point so an oblique nozzle ray reaches
+	-- the real wall instead of ending microscopically in front of it. Any closer
+	-- obstruction still wins and stops the water normally.
+	local collisionLength = physicalLength
+	if cameraResult ~= nil then collisionLength += NOZZLE_SURFACE_OVERSHOOT end
+	local cursorResult = Workspace:Raycast(origin, desiredOffset.Unit * collisionLength, raycastParams)
+	local target = if cursorResult then cursorResult.Position else origin + desiredOffset.Unit * physicalLength
 	local offset = target - origin
 	local pressureMultiplier = getPressureMultiplier(offset.Magnitude)
+	local hitJobID = if cursorResult then cursorResult.Instance:GetAttribute("JobID") else nil
+	currentSprayJobID = if typeof(hitJobID) == "string" and activeIncludedLookup[hitJobID] then hitJobID else nil
+	local hitJobType = if typeof(hitJobID) == "string" then getJobType(hitJobID) else nil
+	local hitSurfaceNormal = if cursorResult
+		then getAuthoredSurfaceNormal(cursorResult.Instance, cursorResult.Normal)
+		else Vector3.yAxis
+	-- Upward-facing house surfaces represent roofs and inaccessible ledges. A
+	-- player must climb until the nozzle is close to their height; walls remain
+	-- washable normally from the ground.
+	if cursorResult ~= nil
+		and (hitJobType == "House" or hitJobType == "Mansion")
+		and hitSurfaceNormal.Y > 0.35
+		and target.Y - origin.Y > MAX_UPWARD_HOUSE_REACH
+	then
+		pressureMultiplier = 0
+	end
+	local canClean = pressureMultiplier > 0.001
 	local brushScale = 1 + (1 - pressureMultiplier) * 1.25
 	local washerWidth = getWasherStat("WasherSprayWidth", 1)
 	local logicalBrushRadius = math.max(PIXEL_BRUSH_RADIUS, math.round(PIXEL_BRUSH_RADIUS * brushScale * washerWidth))
-	local hitJobID = if cursorResult then cursorResult.Instance:GetAttribute("JobID") else nil
-	currentSprayJobID = if typeof(hitJobID) == "string" and activeIncludedLookup[hitJobID] then hitJobID else nil
 	local rawDrivewayTierScale = math.clamp(getCleanSpeed() / DEFAULT_CLEAN_SPEED, 1, 4)
-	local drivewayTierScale = if rawDrivewayTierScale <= 2.3
-		then rawDrivewayTierScale
-		else 2.3 + (rawDrivewayTierScale - 2.3) * 0.25
-	local jobBrushMultiplier = if hitJobID == HOUSE_JOB_ID
+	-- Pressure still improves substantially by tier, while coverage grows gently.
+	-- This prevents high-tier width and driveway scaling from multiplying into
+	-- an oversized cleaning circle.
+	local drivewayTierScale = 1 + (rawDrivewayTierScale - 1) * 0.15
+	local jobBrushMultiplier = if hitJobType == "House" or hitJobType == "Mansion"
 		then HOUSE_BRUSH_RADIUS_MULTIPLIER
-		elseif hitJobID == CAR_JOB_ID then CAR_BRUSH_RADIUS_MULTIPLIER
-		elseif hitJobID == DRIVEWAY_JOB_ID
+		elseif hitJobType == "Car" then CAR_BRUSH_RADIUS_MULTIPLIER
+		elseif hitJobType == "Driveway"
 			then DRIVEWAY_BRUSH_RADIUS_MULTIPLIER * drivewayTierScale
 		else 1
 	local worldBrushRadius = BASE_WORLD_BRUSH_RADIUS * brushScale * jobBrushMultiplier * washerWidth
-	local segments = if cursorResult
+	local segments = if cursorResult and canClean
 		then findDirtSegments(cursorResult.Instance, cursorResult.Position, logicalBrushRadius, worldBrushRadius)
 		else {}
-	local representativeSegment = segments[1]
+	local representativeSegment = if cursorResult then getClosestSegment(segments, cursorResult.Position) else nil
+	if representativeSegment ~= nil then
+		hitSurfaceNormal = getAuthoredSurfaceNormal(representativeSegment, hitSurfaceNormal)
+	end
 	if cursorResult ~= nil then
 		local isActiveJobTarget = typeof(hitJobID) == "string" and activeIncludedLookup[hitJobID] == true
 		local hitDriveway = cursorResult.Instance == dirtDriveway
 			or cursorResult.Instance:GetAttribute("DirtPixel") == true
-		if isActiveJobTarget and hitDriveway then
+		if canClean and isActiveJobTarget and hitDriveway then
 			cleanHighResolutionDirt(cursorResult.Position, pressureMultiplier, brushScale)
 		else
 			previousDirtImagePoint = nil
 		end
-		if isActiveJobTarget and hitJobID == HOUSE_JOB_ID then
-			cleanHouseLiquidDirt(
+		if canClean and isActiveJobTarget and (hitJobType == "House" or hitJobType == "Mansion" or hitJobType == "Car") then
+			cleanSurfaceLiquidDirt(
+				hitJobID,
 				cursorResult.Position,
-				cursorResult.Normal,
+				hitSurfaceNormal,
 				pressureMultiplier,
 				brushScale,
 				deltaTime
 			)
-		elseif isActiveJobTarget and hitJobID == DRIVEWAY_JOB_ID then
+		elseif canClean and isActiveJobTarget and hitJobType == "Driveway" then
 			cleanDrivewayLiquidDirt(
 				cursorResult.Position,
 				pressureMultiplier,
 				worldBrushRadius,
 				deltaTime
 			)
+		else
+			previousDrivewayImagePoint = nil
 		end
 	else
 		previousDirtImagePoint = nil
+		previousDrivewayImagePoint = nil
 	end
 	if shouldReportWater then
 		SprayWaterRequest:FireServer(representativeSegment)
@@ -1898,14 +2328,19 @@ RunService.RenderStepped:Connect(function(deltaTime)
 	-- second ray from the nozzle used to strike a neighboring pixel at shallow
 	-- angles, making the water line appear offset from the mouse cursor.
 	if offset.Magnitude < 0.01 then
-		updateWaterStream(origin, false, 0)
+		updateWaterStream(origin, false, 0, 0)
 		return
 	end
 	local mudIntensity = if representativeSegment ~= nil
 		and activeIncludedLookup[representativeSegment:GetAttribute("JobID")] == true
 		then pressureMultiplier
 		else 0
-	updateWaterStream(target, cursorResult ~= nil, mudIntensity)
+	updateWaterStream(target, cursorResult ~= nil, mudIntensity, pressureMultiplier)
+	AudioManager:UpdateSprayImpact(
+		if cursorResult and cursorResult.Instance:IsA("BasePart") then cursorResult.Instance else nil,
+		pressureMultiplier,
+		mudIntensity > 0
+	)
 
 	-- Cleaning is selected from the camera-to-cursor ray and is only permitted
 	-- for dirt belonging to the player's currently confirmed active job.
